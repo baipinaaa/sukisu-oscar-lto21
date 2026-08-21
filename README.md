@@ -33,6 +33,7 @@ Linux version 5.4.302-qgki-gc8c87694a044 (root@3c794f190b77)
 | 项目 | sukisu-oscar (旧) | sukisu-oscar-lto21 (本方案) |
 |---|---|---|
 | 编译器 | clang-r510928 (clang 14) | clang-r563880 (clang 21.0.0, 官方同源) |
+| clang 分支 | main | android16-qpr1-release (clang21 只在此分支) |
 | 链接器 | GNU ld | ld.lld (LLVM=1) |
 | LTO | 无 (LTO_NONE) | ThinLTO |
 | CFI | 无 | CFI_CLANG + CFI_CLANG_SHADOW (官方 enforcing) |
@@ -43,7 +44,6 @@ Linux version 5.4.302-qgki-gc8c87694a044 (root@3c794f190b77)
 | 编译时间 | 40-90 分钟 | 60-120 分钟 (LTO 链接慢) |
 
 ## 编译流程 (GitHub Actions, 23 步)
-
 ```
 检出仓库 → 内核源码(缓存) → 依赖 → clang21(缓存) → 集成 ReSukiSU
 → SUSFS 5.4 patch → trace include / tcpc / oplus_project 源码兼容
