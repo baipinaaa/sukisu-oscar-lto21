@@ -1,0 +1,468 @@
+# ============================================================
+# ReSukiSU + SUSFS (隐藏 SELinux) 内核构建 — Realme Q5 / 9 5G (oscar, RMX3478)
+# ★ LTO 方案 (clang21 + ThinLTO + CFI + LLD) ★
+# 平台: SM6375 (holi) | 内核: 5.4 QGKI | LineageOS 23.2
+#
+# 与 sukisu-oscar (clang14 + GNU ld + workaround patch) 的区别:
+#   - 用 clang21 (clang-r574158, 官方 boot.img 版本串同源 21.0.0)
+#   - 用 make LLVM=1 (LD=ld.lld, AR=llvm-ar, NM=llvm-nm 全套 LLVM 工具)
+#   - 官方 defconfig 自带的 CONFIG_LTO_CLANG=y + CONFIG_CFI_CLANG=y
+#     不再被降级 (之前用 GNU ld 导致 LD_IS_LLD=n -> Kconfig 自动降级
+#     LTO_NONE, 这就是 WiFi/蓝牙/音频全挂的根源)
+#   - 因此不需要 60_/70_/80_ 三个 workaround patch:
+#       * 60_ 跳 CRC  -> 不需要 (LTO 下 struct module 布局与官方一致,
+#                         module_layout CRC 自动匹配)
+#       * 70_ 假 cfi_slowpath -> 不需要 (CFI_CLANG=y 内核自带真实现)
+#       * 80_ 关 PREL32 -> 不需要 (LTO_CLANG=y 时 PREL32 自动 n)
+#   - ReSukiSU 原生支持 CFI (.cfi_jt 符号解析, symbol_resolver.c),
+#     SUSFS 用 kprobe (官方 CONFIG_KPROBES=y), 兼容 CFI enforcing
+#   - 实测参考: Xiaomi Mi Mix 4 (5.4.302) + KSU-Next + SUSFS v1.5.5
+#     在 clang LTO + CFI + Shadow Call Stack 下成功编译 (社区实证)
+#
+# 用法:
+#   1. 在 GitHub 新建仓库，把本文件放到 .github/workflows/ 下并 push
+#      (patches/50_add_susfs_in_kernel-5.4.patch 必须一起推)
+#   2. Actions 页面 → Build SukiSU LTO21 Kernel for oscar → Run workflow
+#      (los_date 填你手机当前系统 nightly 的日期，必须一致！)
+#   3. 构建完成(约 60-120 分钟, LTO 链接较慢)后下载 artifact: new_boot.img
+#   4. fastboot 双槽刷入 (见 README.md)
+#
+# 已知风险 (详细见 README.md):
+#   - clang21 编译 5.4 官方源码: 官方 boot.img 实证可行 (官方即 clang21)
+#   - 官方 Werror: 5.4 Makefile KBUILD_CFLAGS += -Werror, clang21 新警告
+#     可能触发编译失败 (官方源码已通过, 风险在我们加的 patch)
+#   - LTO 编译时间: ThinLTO 链接全内核较慢, 首次构建预计 60-120 分钟
+#   - CFI enforcing (官方 # CONFIG_CFI_PERMISSIVE is not set):
+#     KSU syscall table hook 需 .cfi_jt 跳板地址 (ReSukiSU 已内置支持)
+# ============================================================
+name: Build SukiSU LTO21 Kernel for oscar
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支 (默认 lineage-23.2，对应你刷的 LineageOS 23.2)'
+        required: true
+        type: string
+        default: 'lineage-23.2'
+      los_version:
+        description: 'LineageOS 版本 (用于 nightly 下载链接)'
+        required: true
+        type: string
+        default: '23.2'
+      los_date:
+        description: 'LineageOS nightly 日期 YYYYMMDD (必须与你手机当前系统一致!)'
+        required: true
+        type: string
+        default: '20260817'
+      custom_version:
+        description: '自定义版本名 (可选，显示在 uname -r)'
+        required: false
+        type: string
+        default: ''
+      enable_cfi:
+        description: '开启 CFI (默认 true=官方 enforcing; false=仅 LTO 不开 CFI)'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  DEVICE: 'oscar'
+  CLANG_VER: 'clang-r574158'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      # ============ 0. 检出本仓库 (含 patches/ 下的 SUSFS patch) ============
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ============ 1. 内核源码 (缓存) ============
+      - name: 恢复内核源码缓存
+        id: cache-kernel
+        uses: actions/cache/restore@v6
+        with:
+          path: kernel
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}
+
+      - name: 下载 oscar 内核源码 (LineageOS)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.kernel_branch }}" \
+            https://github.com/LineageOS/android_kernel_realme_sm6375 kernel
+          echo "内核分支: ${{ github.event.inputs.kernel_branch }}"
+          ls kernel/arch/arm64/configs/vendor/ | grep holi
+
+      - name: 保存内核源码缓存
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: kernel
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}
+
+      # ============ 2. 编译依赖 ============
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make gcc flex bison bc cpio lz4 xz-utils \
+            libssl-dev libncurses-dev libelf-dev device-tree-compiler \
+            ccache zip unzip
+          # LLVM=1 模式不需要 binutils-aarch64-linux-gnu (ld.lld/llvm-ar 全在 clang 里)
+
+      # ============ 3. AOSP Clang 21 (缓存) ============
+      # clang-r574158 = clang/LLD 21.0.0 (官方 oscar boot.img 版本串同源:
+      #   "Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c)
+      #    clang version 21.0.0")
+      # r563880c 是 Google 内部版本, 公开 prebuilt 中最接近的是 r574158 (21.0.0)
+      - name: 恢复 AOSP Clang 21 缓存
+        id: cache-clang
+        uses: actions/cache/restore@v6
+        with:
+          path: clang
+          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v1
+
+      - name: 下载 AOSP Clang 21 (sparse checkout, 只拉 clang-r574158)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          # sparse + blob:none 只下载需要的 clang 版本目录 (~1.5GB)
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
+          cd clang
+          git sparse-checkout set clang-r574158
+          clang-r574158/bin/clang --version | head -1
+          echo "--- 确认全套 LLVM 工具 (LLVM=1 需要) ---"
+          ls clang-r574158/bin/ | grep -E "^(clang|ld\.lld|llvm-ar|llvm-nm|llvm-strip|llvm-objcopy|llvm-objdump)" | head -10
+
+      - name: 保存 AOSP Clang 21 缓存
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: clang
+          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v1
+
+      # ============ 4. ReSukiSU 集成 (全量 clone) ============
+      # ReSukiSU = SukiSU-Ultra 的独立重构 fork (GPL-3.0)。
+      # Kbuild 强制要求 KernelSU 目录是 git 仓库 (rev-list 计数版本号) +
+      # 内核树根有 .git —— 因此 ReSukiSU 必须完整 clone (不能 --depth 1)。
+      # ★ CFI 兼容: ReSukiSU 原生支持 CFI 内核 (.cfi_jt 符号解析,
+      #   infra/symbol_resolver.c; __nocfi 宏标记被 hook 的函数)。
+      - name: 集成 ReSukiSU (全量 clone + symlink)
+        run: |
+          cd kernel
+          rm -rf KernelSU
+          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
+          cd KernelSU
+          echo "ReSukiSU commit: $(git log --oneline -1)"
+          ls kernel/Kbuild kernel/Kconfig kernel/selinux/selinux.c && echo "结构正确 (kernel/ 目录)"
+          cd ..
+          ln -sfn "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> drivers/Makefile
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
+          echo "--- 检查 ReSukiSU 源码是否集成 ---"
+          ls -la drivers/kernelsu/ | head -8
+          grep -n "kernelsu" drivers/Makefile
+
+      # ============ 4.5 应用 SUSFS 5.4 patch (fs/ 层, 隐藏 SELinux 核心) ============
+      # 官方 SUSFS v2.2.0 只有 GKI 5.10 patch。oscar 是高通 5.4 QGKI ——
+      # 本仓库已移植为 5.4 版本 (patches/50_add_susfs_in_kernel-5.4.patch)。
+      # SUSFS 用 kprobe (pts_unix98_lookup_kp 等), 官方 CONFIG_KPROBES=y,
+      # kprobe 子系统与 CFI 兼容 (CFI 只校验间接调用, kprobe 是直接指令替换)。
+      - name: 应用 SUSFS 5.4 patch
+        run: |
+          cd kernel
+          patch -p1 < ../patches/50_add_susfs_in_kernel-5.4.patch
+          echo "--- 验证 SUSFS 已集成 ---"
+          ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+          grep -n "susfs" fs/Makefile
+          grep -c "CONFIG_KSU_SUSFS" fs/namei.c
+
+      # ============ 4.6 可选: CFI 关闭时提供假 __cfi_slowpath ============
+      # 仅当 enable_cfi=false (关闭 CFI) 时应用: 官方 vendor 模块是 CFI 编译的,
+      # 引用 __cfi_slowpath; 关闭 CFI 后内核无此符号 -> 模块被拒。提供假实现
+      # 放行 (模块自带 __cfi_check 原样运行)。CFI 开启 (默认) 时内核自带真
+      # 实现, 此 patch 绝不能用 (重复定义冲突)。
+      - name: 应用 __cfi_slowpath 兼容 patch (仅 CFI 关闭时)
+        if: ${{ github.event.inputs.enable_cfi == 'false' }}
+        run: |
+          cd kernel
+          patch -p1 < ../patches/70_add_cfi_slowpath.patch
+          echo "--- 验证 cfi patch 已应用 ---"
+          grep -n "__cfi_slowpath" kernel/module.c
+
+      # ============ 5. 修复高通 trace include (clang 兼容) ============
+      - name: 修复高通 TRACE_INCLUDE_PATH (clang 兼容)
+        run: |
+          cd kernel
+          # 高通 trace.h 的 TRACE_INCLUDE_PATH 用相对路径 (如 "." / "../..")，
+          # define_trace.h 展开成 #include "<路径>/<FILE>.h"——clang 不搜索
+          # "主源文件所在目录"，相对路径全部解析不到。统一改为相对内核根的
+          # 目录路径 + 纯文件名 (语义等价)。
+          grep -rln --exclude-dir=.git "#define TRACE_INCLUDE_PATH" \
+            --include="*.h" . 2>/dev/null | while read f; do
+            if grep -qE "^#define TRACE_INCLUDE_PATH \.\.?(/.*)?$" "$f"; then
+              dir=$(dirname "$f" | sed 's|^\./||')
+              [ "$dir" = "." ] && dir=""
+              file=$(grep -m1 "^#define TRACE_INCLUDE_FILE" "$f" | sed 's|.*#define TRACE_INCLUDE_FILE *||; s| *$||')
+              base=$(basename "$file")
+              sed -i "s|^#define TRACE_INCLUDE_PATH .*|#define TRACE_INCLUDE_PATH $dir|" "$f"
+              sed -i "s|^#define TRACE_INCLUDE_FILE .*|#define TRACE_INCLUDE_FILE $base|" "$f"
+              echo "patched: $f  (PATH=$dir FILE=$base)"
+            else
+              echo "skip:    $f (PATH 已是根相对路径)"
+            fi
+          done
+          echo "--- 验证 ---"
+          grep -n "TRACE_INCLUDE" kernel/sched/walt/trace.h
+          grep -n "TRACE_INCLUDE" techpack/camera/drivers/cam_utils/cam_trace.h
+
+      # ============ 5.5 修复 tcpc inc/ 相对 include (clang 兼容) ============
+      - name: 修复 tcpc inc/ include (clang 兼容)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          f = 'drivers/usb/typec/tcpc/inc/pd_dpm_pdo_select.h'
+          s = open(f, encoding='utf-8').read()
+          old = '#include "inc/tcpci.h"'
+          assert old in s, 'pattern not found in ' + f
+          open(f, 'w', encoding='utf-8').write(s.replace(old, '#include "tcpci.h"', 1))
+          print('tcpc inc/ include fixed')
+          PYEOF
+          grep -n 'include .tcpci' drivers/usb/typec/tcpc/inc/pd_dpm_pdo_select.h
+
+      # ============ 5.6 修复 oplus_project section mismatch (modpost FATAL) ============
+      - name: 修复 oplus_project section mismatch (modpost)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          def patch(fname, pairs):
+              s = open(fname, encoding='utf-8').read()
+              for old, new in pairs:
+                  assert old in s, 'PATCH FAIL %s: %r' % (fname, old[:60])
+                  s = s.replace(old, new, 1)
+              open(fname, 'w', encoding='utf-8').write(s)
+              print('OK', fname)
+
+          for f in ['drivers/soc/oplus/system/oplus_project/qcom/oplus_project.c',
+                    'drivers/soc/oplus/system/oplus_project/gki/oplus_project.c']:
+              s = open(f, encoding='utf-8').read()
+              if 'parent_1, struct proc_dir_entry *parent_2' in s:
+                  pairs = [
+                      ('static void update_manifest(struct proc_dir_entry *parent_1, struct proc_dir_entry *parent_2)',
+                       'static void __init update_manifest(struct proc_dir_entry *parent_1, struct proc_dir_entry *parent_2)'),
+                      ('static void update_telephony_manifest(struct proc_dir_entry *parent_1, struct proc_dir_entry *parent_2)',
+                       'static void __init update_telephony_manifest(struct proc_dir_entry *parent_1, struct proc_dir_entry *parent_2)'),
+                  ]
+              else:
+                  pairs = [
+                      ('static void update_manifest(struct proc_dir_entry *parent)',
+                       'static void __init update_manifest(struct proc_dir_entry *parent)'),
+                      ('static void update_telephony_manifest(struct proc_dir_entry *parent)',
+                       'static void __init update_telephony_manifest(struct proc_dir_entry *parent)'),
+                  ]
+              patch(f, pairs)
+          PYEOF
+          grep -rn '__init update_manifest\|__init update_telephony' drivers/soc/oplus/system/oplus_project/
+
+      # ============ 6. 配置 + 编译 (LLVM=1 全套) ============
+      # ★★★ 本方案核心: make LLVM=1 → LD=ld.lld + AR=llvm-ar + NM=llvm-nm
+      #   → LD_IS_LLD=y → CONFIG_LTO_CLANG=y / CONFIG_CFI_CLANG=y 生效
+      #   (官方 defconfig 自带这两个 =y, 之前用 GNU ld 被 Kconfig 降级!)
+      - name: 恢复 ccache
+        id: cache-ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.ccache
+          key: ccache-oscar-lto21-${{ github.event.inputs.kernel_branch }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-oscar-lto21-${{ github.event.inputs.kernel_branch }}-
+
+      - name: 配置内核 (LLVM=1 + holi-qgki defconfig + SukiSU 开关)
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang/${{ env.CLANG_VER }}/bin:$PATH
+          # LLVM=1: 全套 LLVM 工具链 (clang + ld.lld + llvm-ar + llvm-nm + llvm-strip)
+          make LLVM=1 ARCH=arm64 KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
+          # ★ LineageOS 官方 oscar 构建 = holi-qgki_defconfig + debugfs.config 合并
+          ./scripts/config -d DEBUG_FS -d PAGE_OWNER
+          # 开启 ReSukiSU + SUSFS 全部 9 个子开关
+          ./scripts/config -e KSU -e KALLSYMS -e KALLSYMS_ALL \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
+            -e KSU_SUSFS_SUS_MAP \
+            -d KSU_TRACEPOINT_HOOK \
+            -d CONFIG_LOCALVERSION_AUTO \
+            --set-str CONFIG_LOCALVERSION "-qgki-gc8c87694a044" || true
+          if [ -n "${{ github.event.inputs.custom_version }}" ]; then
+            ./scripts/config --set-str LOCALVERSION "-${{ github.event.inputs.custom_version }}"
+          fi
+          # CFI 开关 (默认开=官方 enforcing; false=仅 LTO)
+          if [ "${{ github.event.inputs.enable_cfi }}" = "true" ]; then
+            ./scripts/config -e CFI_CLANG -e CFI_CLANG_SHADOW
+            echo "CFI: 开启 (官方 enforcing 模式)"
+          else
+            ./scripts/config -d CFI_CLANG -d CFI_CLANG_SHADOW
+            echo "CFI: 关闭 (仅 LTO, 保留官方 __cfi_slowpath 引用由 70_ patch 兜底)"
+          fi
+          make LLVM=1 ARCH=arm64 \
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' olddefconfig
+          echo "--- 配置验证 ---"
+          grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
+            || echo "!! 未找到 KSU/SUSFS 配置，请检查 ReSukiSU 集成是否成功"
+          echo "--- LTO/CFI 验证 (本方案核心!) ---"
+          grep -E "CONFIG_LTO|CONFIG_CFI|CONFIG_THINLTO|CONFIG_LD_IS_LLD|CONFIG_CC_IS_CLANG" .config
+          echo "--- PREL32 验证 (LTO 下应自动为 n) ---"
+          grep "HAVE_ARCH_PREL32" .config \
+            && echo "!! PREL32 仍开启 (LTO 未生效?)" \
+            || echo "OK: PREL32 已关闭 (LTO_CLANG=y 自动)"
+
+      - name: 编译内核 (LLVM=1 + ccache 加速)
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang/${{ env.CLANG_VER }}/bin:$PATH
+          export CCACHE_DIR=$HOME/.ccache
+          ccache -M 4G
+          # LLVM=1: 全套 LLVM 工具链
+          # KCFLAGS=-I. 让内核根进入 include 搜索链 (高通相对 include 必需)
+          # -DKSU_COMPAT_HAS_SELINUX_STATE: 5.4 高通 selinux_state 无 GKI 字段,
+          # 该宏触发 ReSukiSU selinux.c 的 5.4 兼容分支 (selinux_hide fake_state)
+          # ThinLTO 链接较慢 (ld.lld --thinlto-cache-dir=.thinlto-cache)
+          make LLVM=1 ARCH=arm64 CC="ccache clang" \
+            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' -j$(nproc)
+          ls -la arch/arm64/boot/Image
+          echo "--- 内核版本 ---"
+          strings arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      # ============ 6. 原版 boot.img (缓存) ============
+      - name: 恢复原版 boot.img 缓存
+        id: cache-boot
+        uses: actions/cache/restore@v6
+        with:
+          path: boot.img
+          key: boot-oscar-${{ github.event.inputs.los_date }}
+
+      - name: 从 LineageOS nightly 获取原版 boot.img (直链或 payload 提取)
+        if: steps.cache-boot.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          EXPECT_SHA=""
+          if curl -s --max-time 20 "https://download.lineageos.org/api/v2/devices/${DEVICE}/builds" -o los_builds.json; then
+          EXPECT_SHA=$(python3 -c "
+          import json
+          d = json.load(open('los_builds.json'))
+          date = '${{ github.event.inputs.los_date }}'
+          for b in d:
+              if b.get('date','').replace('-','') == date:
+                  for f in b.get('files',[]):
+                      if f.get('filename') == 'boot.img':
+                          print(f.get('sha256',''))
+          ")
+            rm -f los_builds.json
+            echo "官方 API 返回 boot.img sha256: $EXPECT_SHA"
+          else
+            echo "官方 API 不可用, 跳过 sha256 校验"
+          fi
+          for BOOT_URL in \
+            "https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img" \
+            "https://mirror.freedif.org/lineageos/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img"; do
+            echo "尝试直链: $BOOT_URL"
+            HTTP=$(curl -sL -o boot.img -w '%{http_code}' --retry 3 "$BOOT_URL" || echo 000)
+            if [ "$HTTP" = "200" ] && [ -s boot.img ]; then
+              echo "直链下载成功: $(stat -c%s boot.img) bytes"
+              break
+            fi
+            rm -f boot.img
+          done
+          if [ -s boot.img ]; then
+            echo "boot.img 就绪 (直链)"
+          else
+            echo "直链均不可用, 改用 payload.bin 提取"
+            LOS_URL="https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/lineage-${{ github.event.inputs.los_version }}-${{ github.event.inputs.los_date }}-nightly-${DEVICE}-signed.zip"
+            echo "下载: $LOS_URL"
+            curl -sL --retry 3 -o los.zip "$LOS_URL"
+            unzip -o los.zip payload.bin
+            rm -f los.zip
+            if [ ! -x ./payload-dumper-go ]; then
+              PDG_URL=$(curl -s https://api.github.com/repos/ssut/payload-dumper-go/releases/latest | python3 -c "import json,sys;d=json.load(sys.stdin);print([a['browser_download_url'] for a in d['assets'] if 'linux_amd64' in a['name']][0])")
+              echo "下载 payload-dumper-go: $PDG_URL"
+              curl -sL -o pdg.tar.gz "$PDG_URL"
+              tar -xzf pdg.tar.gz
+              rm -f pdg.tar.gz
+            fi
+            ./payload-dumper-go -o . -p boot payload.bin
+            rm -f payload.bin
+            ls -la boot.img
+          fi
+          python3 -c "
+          with open('boot.img','rb') as f:
+              magic = f.read(8)
+          assert magic == b'ANDROID!', 'boot.img magic 校验失败: %r' % magic
+          print('boot.img magic OK')
+          "
+          if [ -n "$EXPECT_SHA" ]; then
+            ACTUAL_SHA=$(sha256sum boot.img | cut -d' ' -f1)
+            echo "实际 sha256: $ACTUAL_SHA"
+            if [ "$ACTUAL_SHA" != "$EXPECT_SHA" ]; then
+              echo "!! sha256 不匹配: 期望 $EXPECT_SHA"
+              exit 1
+            fi
+            echo "sha256 校验通过"
+          fi
+          test -s boot.img
+          echo "boot.img 就绪"
+
+      - name: 保存原版 boot.img 缓存
+        if: steps.cache-boot.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: boot.img
+          key: boot-oscar-${{ github.event.inputs.los_date }}
+
+      # ============ 7. 打包 + 上传 ============
+      - name: 解包原 boot + 打包 new_boot.img
+        run: |
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
+          python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_split
+          ls boot_split/
+          OS_VER=$(cat boot_split/os_version 2>/dev/null || echo "16.0.0")
+          OS_PATCH=$(cat boot_split/os_patch_level 2>/dev/null || echo "2026-08")
+          HDR_VER=$(cat boot_split/header_version 2>/dev/null || echo "4")
+          echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
+          python3 mkbootimg/mkbootimg.py \
+            --kernel kernel/arch/arm64/boot/Image \
+            --ramdisk boot_split/ramdisk \
+            --cmdline "$(cat boot_split/cmdline)" \
+            --header_version $HDR_VER \
+            --os_version "$OS_VER" --os_patch_level "$OS_PATCH" \
+            -o new_boot.img
+          echo "=== 打包完成 ==="
+          ls -la new_boot.img
+
+      - name: 验证产物
+        run: |
+          python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --out new_split
+          echo "原 boot 内核大小: $(stat -c%s boot_split/kernel)"
+          echo "新 boot 内核大小: $(stat -c%s new_split/kernel)"
+          echo "new_boot.img MD5: $(md5sum new_boot.img)"
+          sha256sum new_boot.img > SHA256SUMS.txt
+
+      - name: 保存 ccache (构建成功才更新，供下次加速)
+        if: success()
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.ccache
+          key: ccache-oscar-lto21-${{ github.event.inputs.kernel_branch }}-${{ github.run_id }}
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-sukisu-lto21-${{ github.event.inputs.los_date }}-new_boot
+          path: |
+            new_boot.img
+            SHA256SUMS.txt
+            kernel/arch/arm64/boot/Image
+            kernel/.config
+          if-no-files-found: error

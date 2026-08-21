@@ -1,0 +1,16 @@
+--- a/kernel/module.c	2026-08-21 19:53:38.992168400 +0800
++++ b/kernel/module.c	2026-08-21 19:53:39.113474000 +0800
+@@ -4766,3 +4766,13 @@
+ }
+ EXPORT_SYMBOL(module_layout);
+ #endif
++
++/* [ReSukiSU] 兼容官方 CFI 编译的 vendor 模块:
++ * 官方内核 CONFIG_CFI_CLANG=y (clang21 + LTO + LLD), vendor 分区预编译
++ * 模块 (.ko) 引用 __cfi_slowpath。自编译内核未开 CFI, 若不提供该符号,
++ * 模块加载报 "unknown symbol __cfi_slowpath" 被拒 (WiFi/蓝牙/音频全挂)。
++ * 提供假实现直接放行: 模块自身的 __cfi_check 不受影响, 功能完整。 */
++void __cfi_slowpath(uint64_t id, void *ptr)
++{
++}
++EXPORT_SYMBOL(__cfi_slowpath);
