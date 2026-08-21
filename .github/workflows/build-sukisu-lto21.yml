@@ -4,7 +4,7 @@
 # 平台: SM6375 (holi) | 内核: 5.4 QGKI | LineageOS 23.2
 #
 # 与 sukisu-oscar (clang14 + GNU ld + workaround patch) 的区别:
-#   - 用 clang21 (clang-r574158, 官方 boot.img 版本串同源 21.0.0)
+#   - 用 clang21 (clang-r563880, 官方 boot.img 版本串同源 21.0.0 based on r563880c)
 #   - 用 make LLVM=1 (LD=ld.lld, AR=llvm-ar, NM=llvm-nm 全套 LLVM 工具)
 #   - 官方 defconfig 自带的 CONFIG_LTO_CLANG=y + CONFIG_CFI_CLANG=y
 #     不再被降级 (之前用 GNU ld 导致 LD_IS_LLD=n -> Kconfig 自动降级
@@ -68,7 +68,7 @@ on:
 
 env:
   DEVICE: 'oscar'
-  CLANG_VER: 'clang-r574158'
+  CLANG_VER: 'clang-r563880'
 
 jobs:
   build:
@@ -111,35 +111,42 @@ jobs:
           # LLVM=1 模式不需要 binutils-aarch64-linux-gnu (ld.lld/llvm-ar 全在 clang 里)
 
       # ============ 3. AOSP Clang 21 (缓存) ============
-      # clang-r574158 = clang/LLD 21.0.0 (官方 oscar boot.img 版本串同源:
-      #   "Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c)
-      #    clang version 21.0.0")
-      # r563880c 是 Google 内部版本, 公开 prebuilt 中最接近的是 r574158 (21.0.0)
+      # clang-r563880 = clang 21.0.0 based on r563880 (官方 oscar boot.img
+      #   版本串完全一致: "Android (14054515, +pgo, +bolt, +lto, +mlgo, based
+      #   on r563880c) clang version 21.0.0"; 官方是 Google 内部 c 变体,
+      #   公开 prebuilt 为 r563880)
+      # ★ 重要: clang-r563880 只在 android16-qpr1-release 分支, main/master
+      #   分支没有! (main 只有 r547379=clang20 / r584948=clang22)
       - name: 恢复 AOSP Clang 21 缓存
         id: cache-clang
         uses: actions/cache/restore@v6
         with:
           path: clang
-          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v1
+          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v2
 
-      - name: 下载 AOSP Clang 21 (sparse checkout, 只拉 clang-r574158)
+      - name: 下载 AOSP Clang 21 (android16-qpr1-release 分支 + sparse)
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
+          set -e
           # sparse + blob:none 只下载需要的 clang 版本目录 (~1.5GB)
-          git clone --depth 1 --filter=blob:none --sparse \
+          # ★ 必须指定 --branch android16-qpr1-release (clang-r563880 只在这)
+          git clone --depth 1 --filter=blob:none --sparse --branch android16-qpr1-release \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
           cd clang
-          git sparse-checkout set clang-r574158
-          clang-r574158/bin/clang --version | head -1
-          echo "--- 确认全套 LLVM 工具 (LLVM=1 需要) ---"
-          ls clang-r574158/bin/ | grep -E "^(clang|ld\.lld|llvm-ar|llvm-nm|llvm-strip|llvm-objcopy|llvm-objdump)" | head -10
+          git sparse-checkout set clang-r563880
+          # ★ 严格验证 (不能用管道掩盖失败; 缺任一工具立即报错退出)
+          test -x clang-r563880/bin/clang || { echo "!! clang 缺失, sparse checkout 失败"; exit 1; }
+          clang-r563880/bin/clang --version | head -1
+          for t in ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf llvm-size; do
+            test -x clang-r563880/bin/$t && echo "OK $t" || { echo "!! $t 缺失 (LLVM=1 必需)"; exit 1; }
+          done
 
       - name: 保存 AOSP Clang 21 缓存
         if: steps.cache-clang.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: clang
-          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v1
+          key: clang-oscar-lto21-${{ env.CLANG_VER }}-v2
 
       # ============ 4. ReSukiSU 集成 (全量 clone) ============
       # ReSukiSU = SukiSU-Ultra 的独立重构 fork (GPL-3.0)。

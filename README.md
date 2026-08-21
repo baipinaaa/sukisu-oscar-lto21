@@ -32,7 +32,7 @@ Linux version 5.4.302-qgki-gc8c87694a044 (root@3c794f190b77)
 
 | 项目 | sukisu-oscar (旧) | sukisu-oscar-lto21 (本方案) |
 |---|---|---|
-| 编译器 | clang-r510928 (clang 14) | clang-r574158 (clang 21.0.0, 官方同源) |
+| 编译器 | clang-r510928 (clang 14) | clang-r563880 (clang 21.0.0, 官方同源) |
 | 链接器 | GNU ld | ld.lld (LLVM=1) |
 | LTO | 无 (LTO_NONE) | ThinLTO |
 | CFI | 无 | CFI_CLANG + CFI_CLANG_SHADOW (官方 enforcing) |
