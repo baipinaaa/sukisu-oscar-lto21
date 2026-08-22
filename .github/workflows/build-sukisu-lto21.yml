@@ -444,24 +444,46 @@ jobs:
 
           # ==== [9b] 官方 commit 对照树 ====
           echo "===== [9b] 官方 commit c8c87694a044 对照树 ====="
-          git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 --depth=1 2>&1 | tail -2 \
-            || git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 2>&1 | tail -2 \
-            || { echo "FETCH FAILED -> unshallow (可能较慢)"; git fetch --unshallow origin 2>&1 | tail -2; }
+          # ★ 必须用 if/else 判断 fetch 真失败 (管道 tail 会掩盖退出码导致 || 失效)
+          OFF_SHA=c8c87694a044c7fb9e10ae580c389dc683c110d1
+          if git fetch origin $OFF_SHA --depth=1 >/tmp/f1.log 2>&1; then
+            echo "fetch sha OK"
+          elif git fetch origin lineage-23.2 --shallow-since=2025-12-01 >/tmp/f2.log 2>&1; then
+            echo "fetch shallow-since OK"
+          else
+            echo "shallow-since FAIL: $(tail -1 /tmp/f2.log)"
+            git fetch --unshallow origin >/tmp/f3.log 2>&1 && echo "unshallow OK" || echo "unshallow FAIL: $(tail -1 /tmp/f3.log)"
+          fi
+          git rev-parse $OFF_SHA^{commit} >/dev/null 2>&1 && echo "对象存在: $OFF_SHA" || echo "!! 对象缺失"
           rm -rf /tmp/otree
-          git worktree add --detach /tmp/otree c8c87694a044c7fb9e10ae580c389dc683c110d1 2>&1 | tail -2 \
-            || { echo "WORKTREE FAILED -> git archive"; mkdir -p /tmp/otree && git archive c8c87694a044c7fb9e10ae580c389dc683c110d1 | tar -x -C /tmp/otree; }
-          cd /tmp/otree
-          cp $GITHUB_WORKSPACE/kernel/.config .config
-          make LLVM=1 ARCH=arm64 olddefconfig 2>&1 | tail -1
-          make LLVM=1 ARCH=arm64 prepare 2>&1 | tail -2
-          for f in kernel/module kernel/printk/printk mm/slab_common drivers/base/core; do
-            rm -f $f.o $f.symtypes
-            make LLVM=1 ARCH=arm64 KBUILD_SYMTYPES=1 KCFLAGS="$KCFLAGS" $f.o 2>&1 | tail -2
-            [ -f $f.symtypes ] && cp $f.symtypes /tmp/off_$(basename $f).symtypes && echo "OK off $f.symtypes"
-          done
-          echo "--- 官方commit树 module.symtypes 的 struct module 定义行 ---"
-          grep -E "^s#module " /tmp/off_module.symtypes 2>/dev/null | head -c 400
-          echo
+          if git worktree add --detach /tmp/otree $OFF_SHA >/tmp/wt.log 2>&1; then
+            echo "worktree OK"
+          else
+            echo "worktree FAIL: $(tail -1 /tmp/wt.log) -> git archive"
+            mkdir -p /tmp/otree
+            git archive $OFF_SHA | tar -x -C /tmp/otree 2>/dev/null || echo "!! archive FAIL"
+          fi
+          SKIP_OFF=0
+          if [ -f /tmp/otree/Makefile ]; then
+            cd /tmp/otree
+          else
+            echo "!! 官方树不可用, 跳过 [9b] 对照"
+            SKIP_OFF=1
+          fi
+          if [ "$SKIP_OFF" = "0" ]; then
+            cp $GITHUB_WORKSPACE/kernel/.config .config
+            make LLVM=1 ARCH=arm64 olddefconfig 2>&1 | tail -1
+            make LLVM=1 ARCH=arm64 prepare 2>&1 | tail -2
+            for f in kernel/module kernel/printk/printk mm/slab_common drivers/base/core; do
+              rm -f $f.o $f.symtypes
+              make LLVM=1 ARCH=arm64 KBUILD_SYMTYPES=1 KCFLAGS="$KCFLAGS" $f.o 2>&1 | tail -2
+              [ -f $f.symtypes ] && cp $f.symtypes /tmp/off_$(basename $f).symtypes && echo "OK off $f.symtypes"
+            done
+            echo "--- 官方commit树 module.symtypes 的 struct module 定义行 ---"
+            grep -E "^s#module " /tmp/off_module.symtypes 2>/dev/null | head -c 400
+            echo
+          fi
+          cd $GITHUB_WORKSPACE/kernel
 
           # ==== [9c] diff 对比 ====
           echo "===== [9c] .symtypes diff (HEAD vs 官方commit) ====="
@@ -479,13 +501,17 @@ jobs:
           # 递归展开必相同 -> CRC 必相同。因此不用 worktree 的 Module.symvers
           # (未全量构建不存在), 直接以 module.symtypes 的 diff 行数判定。
           echo "===== [9d] 结论 ====="
-          D=$(wc -l < /tmp/diff_module.txt 2>/dev/null || echo 9999)
-          echo "module.symtypes diff 行数: $D (官方Image module_layout=0x392bc26a, HEAD实测=0x32aa09e1)"
-          if [ "$D" = "0" ]; then
-            echo "判定: HEAD == 官方纯树 (module_layout 展开相同) -> 官方 Image 含本地修改(非纯 c8c87694a044)"
-            echo "      -> 走 CRC 强制覆盖方案 (改 genksyms 对 MISS 符号输出固定 CRC)"
+          if [ "$SKIP_OFF" = "1" ]; then
+            echo "判定: 官方树不可用 (fetch/worktree 失败) -> 无对照数据, 检查上方日志"
           else
-            echo "判定: 官方纯树与 HEAD 树 .symtypes 有差异 -> 差异在树/config -> 看上方 diff 定位修复"
+            D=$(wc -l < /tmp/diff_module.txt 2>/dev/null || echo 9999)
+            echo "module.symtypes diff 行数: $D (官方Image module_layout=0x392bc26a, HEAD实测=0x32aa09e1)"
+            if [ "$D" = "0" ]; then
+              echo "判定: HEAD == 官方纯树 (module_layout 展开相同) -> 官方 Image 含本地修改(非纯 c8c87694a044)"
+              echo "      -> 走 CRC 强制覆盖方案 (改 genksyms 对 MISS 符号输出固定 CRC)"
+            else
+              echo "判定: 官方纯树与 HEAD 树 .symtypes 有差异 -> 差异在树/config -> 看上方 diff 定位修复"
+            fi
           fi
           cp -f /tmp/head_*.symtypes /tmp/off_*.symtypes /tmp/diff_*.txt $GITHUB_WORKSPACE/diag/ 2>/dev/null || true
           echo "诊断产物已保存到 diag/"
