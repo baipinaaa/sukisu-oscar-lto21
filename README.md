@@ -207,6 +207,30 @@ bus_type / device_driver / kmem_cache / device_node` 展开；HIT 的 17 个
 4. `lsmod` 应出现 btpower/adsp/q6/wcd938x 等音频蓝牙模块
 5. `cat /proc/kallsyms | grep swr_driver_register` 应能解析到地址
 
+## genksyms 双树诊断 (workflow 步骤 17, 新增)
+
+背景：官方 Image 的 `module_layout=0x392bc26a`，LTO21 实测 `0x32aa09e1`。
+静态排查已排除 config（官方=LTO21 子集）、树（284 文件 include 图仅
+4 个无关 DIFF）、编译器（官方 boot.img 实证也是 clang 21.0.0 r563880c，
+llvm-project commit 5e96669f 同源）。
+
+本步骤做**决定性对照实验**（`if: always()` 即使 CRC 校验失败也执行）：
+
+```
+[9a] HEAD 树: KBUILD_SYMTYPES=1 重编 kernel/module.o、printk.o、
+     slab_common.o、drivers/base/core.o → 4 个 .symtypes
+[9b] 官方 commit c8c87694a044 纯树 (git worktree) + 我们的 .config +
+     我们的 clang21 → 同样 4 个 .symtypes + Module.symvers
+[9c] diff 每对 .symtypes → 差异 token 直接可见
+[9d] 判定:
+     · 官方纯树 = 0x392bc26a → 差异在 HEAD 树/config → diff 定位修复
+     · 官方纯树 = 0x32aa09e1 → 官方 Image 含本地修改 (非纯树)
+       → 后续走 CRC 强制覆盖方案 (改 genksyms 输出固定 CRC)
+```
+
+诊断产物（head_*.symtypes / off_*.symtypes / diff_*.txt）随 artifact 上传，
+供本地精确分析。
+
 ## 备选: 关闭 CFI 的降级方案
 
 若 CFI enforcing 下 KSU 引发 panic (无法开机)：

@@ -414,6 +414,83 @@ jobs:
           print('OK: module_layout CRC 与官方/vendor 一致 (其余 MISS 符号仅告警, 见上方列表)')
           PYEOF
 
+      # ============ 6.5 genksyms 双树诊断 (定位 module_layout CRC 差异根因) ============
+      # ★ 背景: 官方 Image 的 module_layout=0x392bc26a, 我们 LTO21 实测 0x32aa09e1。
+      #   静态排查已排除 config(官方=LTO21 子集)/树(284 文件 include 图仅 4 无关 DIFF)/编译器(clang21 同源)。
+      #   本步骤做决定性对照实验: 官方 commit c8c87694a044 纯树 + 我们的 .config + 我们的 clang21,
+      #   重跑 module.o 等 4 个文件的 genksyms (KBUILD_SYMTYPES=1 生成 .symtypes):
+      #     - 若官方纯树也得到 0x32aa09e1 -> 官方 Image 含本地修改(非纯树) -> 走 CRC 强制覆盖方案
+      #     - 若官方纯树得到 0x392bc26a -> 树/config 差异 -> diff .symtypes 直接定位差异 token
+      #   即使上一步 CRC 校验失败也要执行 (诊断必须跑) -> if: always()
+      - name: genksyms 双树诊断 (HEAD vs 官方commit c8c87694a044)
+        if: always()
+        run: |
+          set -x
+          export PATH=$GITHUB_WORKSPACE/clang/${{ env.CLANG_VER }}/bin:$PATH
+          export LOCALVERSION=
+          export KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE'
+          mkdir -p $GITHUB_WORKSPACE/diag
+          cd $GITHUB_WORKSPACE/kernel
+
+          # ==== [9a] 当前树(HEAD) dump: 4 个关键文件的 .symtypes ====
+          echo "===== [9a] HEAD 树 .symtypes ====="
+          for f in kernel/module kernel/printk/printk mm/slab_common drivers/base/core; do
+            rm -f $f.o $f.symtypes
+            make LLVM=1 ARCH=arm64 KBUILD_SYMTYPES=1 KCFLAGS="$KCFLAGS" $f.o 2>&1 | tail -2
+            [ -f $f.symtypes ] && cp $f.symtypes /tmp/head_$(basename $f).symtypes && echo "OK head $f.symtypes"
+          done
+          echo "--- HEAD Module.symvers module_layout ---"
+          grep "module_layout" Module.symvers
+
+          # ==== [9b] 官方 commit 对照树 ====
+          echo "===== [9b] 官方 commit c8c87694a044 对照树 ====="
+          git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 --depth=1 2>&1 | tail -2 \
+            || git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 2>&1 | tail -2 \
+            || { echo "FETCH FAILED -> unshallow (可能较慢)"; git fetch --unshallow origin 2>&1 | tail -2; }
+          rm -rf /tmp/otree
+          git worktree add --detach /tmp/otree c8c87694a044c7fb9e10ae580c389dc683c110d1 2>&1 | tail -2 \
+            || { echo "WORKTREE FAILED -> git archive"; mkdir -p /tmp/otree && git archive c8c87694a044c7fb9e10ae580c389dc683c110d1 | tar -x -C /tmp/otree; }
+          cd /tmp/otree
+          cp $GITHUB_WORKSPACE/kernel/.config .config
+          make LLVM=1 ARCH=arm64 olddefconfig 2>&1 | tail -1
+          make LLVM=1 ARCH=arm64 prepare 2>&1 | tail -2
+          for f in kernel/module kernel/printk/printk mm/slab_common drivers/base/core; do
+            rm -f $f.o $f.symtypes
+            make LLVM=1 ARCH=arm64 KBUILD_SYMTYPES=1 KCFLAGS="$KCFLAGS" $f.o 2>&1 | tail -2
+            [ -f $f.symtypes ] && cp $f.symtypes /tmp/off_$(basename $f).symtypes && echo "OK off $f.symtypes"
+          done
+          echo "--- 官方commit树 module.symtypes 的 struct module 定义行 ---"
+          grep -E "^s#module " /tmp/off_module.symtypes 2>/dev/null | head -c 400
+          echo
+
+          # ==== [9c] diff 对比 ====
+          echo "===== [9c] .symtypes diff (HEAD vs 官方commit) ====="
+          for f in module printk slab_common core; do
+            if [ -f /tmp/head_$f.symtypes ] && [ -f /tmp/off_$f.symtypes ]; then
+              echo "--- $f.symtypes ---"
+              diff /tmp/head_$f.symtypes /tmp/off_$f.symtypes > /tmp/diff_$f.txt 2>&1 || true
+              echo "  diff 行数: $(wc -l < /tmp/diff_$f.txt)"
+              head -40 /tmp/diff_$f.txt
+            fi
+          done
+
+          # ==== [9d] 结论 ====
+          # 判定依据: .symtypes = genksyms 展开前 token 列表, 两树相同 ->
+          # 递归展开必相同 -> CRC 必相同。因此不用 worktree 的 Module.symvers
+          # (未全量构建不存在), 直接以 module.symtypes 的 diff 行数判定。
+          echo "===== [9d] 结论 ====="
+          D=$(wc -l < /tmp/diff_module.txt 2>/dev/null || echo 9999)
+          echo "module.symtypes diff 行数: $D (官方Image module_layout=0x392bc26a, HEAD实测=0x32aa09e1)"
+          if [ "$D" = "0" ]; then
+            echo "判定: HEAD == 官方纯树 (module_layout 展开相同) -> 官方 Image 含本地修改(非纯 c8c87694a044)"
+            echo "      -> 走 CRC 强制覆盖方案 (改 genksyms 对 MISS 符号输出固定 CRC)"
+          else
+            echo "判定: 官方纯树与 HEAD 树 .symtypes 有差异 -> 差异在树/config -> 看上方 diff 定位修复"
+          fi
+          cp -f /tmp/head_*.symtypes /tmp/off_*.symtypes /tmp/diff_*.txt $GITHUB_WORKSPACE/diag/ 2>/dev/null || true
+          echo "诊断产物已保存到 diag/"
+          echo "===== 诊断完成 ====="
+
       # ============ 6. 原版 boot.img (缓存) ============
       - name: 恢复原版 boot.img 缓存
         id: cache-boot
@@ -544,4 +621,5 @@ jobs:
             kernel/arch/arm64/boot/Image
             kernel/.config
             kernel/Module.symvers
+            diag/*
           if-no-files-found: error
