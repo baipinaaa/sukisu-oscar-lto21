@@ -84,22 +84,33 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: kernel
-          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}
+          # ★ v2: 固定到官方 commit c8c87694a044 (旧缓存是 lineage-23.2 HEAD 树,
+          #   与官方 Image 树不一致导致 CRC 差异, 必须失效)
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-c8c87694a044-v2
 
-      - name: 下载 oscar 内核源码 (LineageOS)
+      - name: 下载 oscar 内核源码 (LineageOS, 固定官方 commit c8c87694a044)
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
+          # ★ 必须 checkout 到官方 Image 版本串对应的 commit c8c87694a044:
+          #   lineage-23.2 分支 HEAD 比官方 commit 新 (含 seccomp.filter_count /
+          #   bpf android_kabi_reserved* / BPF_PROG_TYPE_FUSE 等字段), 直接 clone
+          #   HEAD 导致 module_layout 等 23 个符号 CRC 与官方不一致
+          #   (run 32550926252 双树诊断实锤: HEAD vs 官方树 .symtypes diff 4~20 行)
           git clone --depth 1 --branch "${{ github.event.inputs.kernel_branch }}" \
             https://github.com/LineageOS/android_kernel_realme_sm6375 kernel
+          cd kernel
+          git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 --depth=1
+          git checkout c8c87694a044c7fb9e10ae580c389dc683c110d1
+          echo "内核 commit: $(git rev-parse HEAD)"
           echo "内核分支: ${{ github.event.inputs.kernel_branch }}"
-          ls kernel/arch/arm64/configs/vendor/ | grep holi
+          ls arch/arm64/configs/vendor/ | grep holi
 
       - name: 保存内核源码缓存
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: kernel
-          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-c8c87694a044-v2
 
       # ============ 2. 编译依赖 ============
       - name: 安装编译依赖
@@ -503,10 +514,11 @@ jobs:
             D=$(wc -l < /tmp/diff_module.txt 2>/dev/null || echo 9999)
             echo "module.symtypes diff 行数: $D (官方Image module_layout=0x392bc26a, HEAD实测=0x32aa09e1)"
             if [ "$D" = "0" ]; then
-              echo "判定: HEAD == 官方纯树 (module_layout 展开相同) -> 官方 Image 含本地修改(非纯 c8c87694a044)"
+              echo "判定: HEAD == 官方纯树 (checkout 已生效, 构建树 == 官方 Image 树)"
+              echo "      -> 若上方 CRC 校验仍失败, 则官方 Image 含本地修改(非纯 c8c87694a044)"
               echo "      -> 走 CRC 强制覆盖方案 (改 genksyms 对 MISS 符号输出固定 CRC)"
             else
-              echo "判定: 官方纯树与 HEAD 树 .symtypes 有差异 -> 差异在树/config -> 看上方 diff 定位修复"
+              echo "判定: 仍有树差异 -> 看上方 diff 定位修复"
             fi
           fi
           cp -f /tmp/head_*.symtypes /tmp/off_*.symtypes /tmp/diff_*.txt $GITHUB_WORKSPACE/diag/ 2>/dev/null || true
@@ -634,6 +646,7 @@ jobs:
           key: ccache-oscar-lto21-${{ github.event.inputs.kernel_branch }}-${{ github.run_id }}
 
       - name: 上传产物
+        if: always()   # ★ 构建失败也要上传 diag/ (诊断 .symtypes) 供分析
         uses: actions/upload-artifact@v4
         with:
           name: oscar-sukisu-lto21-${{ github.event.inputs.los_date }}-new_boot
@@ -644,4 +657,4 @@ jobs:
             kernel/.config
             kernel/Module.symvers
             diag/*
-          if-no-files-found: error
+          if-no-files-found: warn
