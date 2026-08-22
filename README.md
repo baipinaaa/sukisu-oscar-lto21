@@ -163,8 +163,42 @@ grep -E "CONFIG_LTO|CONFIG_CFI|CONFIG_THINLTO|CONFIG_LD_IS_LLD" .config
 - LTO/CFI 编译后 struct module 布局与官方一致 → module_layout CRC 自动匹配，
   不需要 60_ patch 跳 CRC。
 
+### 8. module_layout CRC 校验 (本轮新增, 见 workflow 编译步骤尾部)
+
+**背景**：run 32489911904 的 Image 中 vendor 模块被拒 (`disagrees about
+version of symbol module_layout`)。三方 CRC 实证：
+
+- vendor swr_dlkm.ko `__versions`: `module_layout=0x392bc26a` (64B/条)
+- 官方 boot.img `__kcrctab` @0x2475ce8 = `0x392bc26a` (40 符号 40/40 一致)
+- LTO21 Image 全镜像 43MB 内 `0x392bc26a` **0 命中** (17/40 HIT)
+
+**MISS 规律**：MISS 的 23 个符号全部涉及 `struct module / device /
+bus_type / device_driver / kmem_cache / device_node` 展开；HIT 的 17 个
+都是基本类型/小结构 (mutex/list/idr/void*)。
+
+**静态排查全部一致**（排除了源码/config 差异）：
+
+- 本地树 module.h/device.h/kobject.h/kernfs.h/slab.h/of.h 等 46 个头
+  == 官方 commit `c8c87694a044`（jsdelivr CDN 拉取，diff 0 行）
+- kernel/module.c == 官方（diff 0）；284 文件 include 图地毯式对比
+  （构建树=分支 HEAD vs 官方 commit）仅 4 个 DIFF：seccomp.h×2 /
+  random.h / asm/seccomp.h + Makefile——**全不在 struct 展开树内**
+- config 地毯式全一致（SLUB/SLAB_FREELIST_HARDENED/ACPI/DMA_CMA/
+  GENERIC_MSI_IRQ_DOMAIN/OF 系列/PM 系列/DEBUG_KOBJECT_RELEASE/…100+ 项）
+- KCFLAGS `-I.` 无影响（ABI 头全尖括号 include，根目录无伪头）
+- SUSFS patch / KSU 集成不碰任何 ABI 头；KSU Kconfig 仅 select KALLSYMS
+- 编译器同 llvm-project commit 5e96669f（r563880c vs r563880 仅 build 号）
+
+**结论**：静态层面 CRC 必须一致但实测不同 → 差异在**构建时环境**
+（旧 run 的 workflow/缓存/工具链细节，无法静态复现）。因此 workflow
+在编译步骤尾部新增 **Module.symvers CRC 校验**：40 个符号对照官方值
+（取自 swr_dlkm.ko `__versions`），`module_layout` 不匹配立即失败；
+且 artifact 上传 `kernel/Module.symvers` 供失败后精确分析。
+
 ## 验证点 (编译后)
 
+0. **Module.symvers 校验**：workflow 自动对比 40 个关键符号 CRC
+   （期望 `module_layout=0x392bc26a`，不匹配构建直接失败）
 1. `.config` 确认 `CONFIG_LTO_CLANG=y` + `CONFIG_CFI_CLANG=y` +
    `CONFIG_THINLTO=y` + `CONFIG_LD_IS_LLD=y` (workflow 自动检查)
 2. `strings Image | grep "Linux version"` 应显示 clang 21 + LLD 21

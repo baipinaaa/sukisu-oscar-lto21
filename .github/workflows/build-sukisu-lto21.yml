@@ -288,6 +288,13 @@ jobs:
         run: |
           cd kernel
           export PATH=$PWD/../clang/${{ env.CLANG_VER }}/bin:$PATH
+          # ★ LOCALVERSION= 空值 (必须!): CONFIG_LOCALVERSION_AUTO=n 时
+          #   scripts/setlocalversion 若发现 LOCALVERSION 环境变量未设置 且 仓库
+          #   不在 annotated tag 上 (GitHub 浅克隆必然) -> 自动追加 '+'
+          #   -> UTS_RELEASE/vermagic 变 5.4.302-qgki-gc8c87694a044+ 与官方
+          #   模块 (a044 无+) 不匹配, check_vermagic 拒绝所有 vendor 模块
+          #   (实测: wifi/蓝牙/音频全挂, run 32489911904)。空值即可 (${LOCALVERSION+set}=set)
+          export LOCALVERSION=
           # LLVM=1: 全套 LLVM 工具链 (clang + ld.lld + llvm-ar + llvm-nm + llvm-strip)
           make LLVM=1 ARCH=arm64 KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
           # ★ LineageOS 官方 oscar 构建 = holi-qgki_defconfig + debugfs.config 合并
@@ -330,6 +337,10 @@ jobs:
         run: |
           cd kernel
           export PATH=$PWD/../clang/${{ env.CLANG_VER }}/bin:$PATH
+          # ★ LOCALVERSION= 空值 (必须!): include/config/kernel.release 带 FORCE
+          #   每次编译都会重新生成, 若此步骤不设 LOCALVERSION 则 '+' 又会被
+          #   追加回去 -> vermagic 再错。与配置步骤保持一致。
+          export LOCALVERSION=
           export CCACHE_DIR=$HOME/.ccache
           ccache -M 4G
           # LLVM=1: 全套 LLVM 工具链
@@ -341,7 +352,67 @@ jobs:
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' -j$(nproc)
           ls -la arch/arm64/boot/Image
           echo "--- 内核版本 ---"
-          strings arch/arm64/boot/Image | grep -m1 "Linux version"
+          VER=$(strings arch/arm64/boot/Image | grep -m1 "Linux version")
+          echo "$VER"
+          # ★ 版本串验证: 必须与官方完全一致 (无 '+') 否则 vermagic 不匹配
+          #   官方模块全被拒 (wifi/蓝牙/音频全挂, run 32489911904 教训)
+          if echo "$VER" | grep -qE 'qgki-gc8c87694a044\+'; then
+            echo "!! 版本串带 '+', vermagic 与官方模块不匹配, 构建失败"
+            exit 1
+          fi
+          echo "OK: 版本串无 '+', vermagic 与官方一致"
+          # ★★★ Module.symvers CRC 校验 (run 32489911904 教训):
+          #   dmesg 报 'disagrees about version of symbol module_layout'——
+          #   vendor 模块 (CFI 编译) 的 __versions CRC 与官方内核一致,
+          #   我们的 LTO21 内核 module_layout/bus_register/driver_register 等
+          #   23 个符号 CRC 不匹配 (涉及 struct module/device/kmem_cache/of 的
+          #   展开差异)。这里直接用 Module.symvers 对照官方值 (取自
+          #   vendor swr_dlkm.ko __versions + 官方 boot.img __kcrctab 反查,
+          #   40 个符号 40/40 实证一致)。module_layout 不匹配立即失败。
+          python3 - <<'PYEOF'
+          import sys
+          EXPECTED = {
+              '__cfi_slowpath': '0x2cd90edd', '__devm_regmap_init': '0x5b50214e',
+              '__kmalloc': '0xeb233a45', '__list_add_valid': '0x68f31cbd',
+              '__list_del_entry_valid': '0xe1537255', '__mutex_init': '0x977f511b',
+              '__regmap_init': '0xd2ca9c4f', '__stack_chk_fail': '0xf0fdf6cb',
+              '__stack_chk_guard': '0x8f678b07', '_dev_err': '0xd72f0f38',
+              'bus_register': '0xccd0b4a3', 'bus_unregister': '0x3ecd980d',
+              'dev_get_regmap': '0xde1c7ffb', 'dev_set_name': '0xf7079be9',
+              'device_for_each_child': '0x552d9990', 'device_register': '0x43ca8ed5',
+              'device_unregister': '0x070f701b', 'driver_register': '0xa1e3d6b3',
+              'driver_unregister': '0x66e29c37', 'get_device': '0x3e9a0de0',
+              'idr_alloc': '0xb8f11603', 'idr_find': '0x20978fb9',
+              'idr_remove': '0x7665a95b', 'kfree': '0x037a0cba',
+              'kmalloc_caches': '0x91ea9a65', 'kmem_cache_alloc_trace': '0x4a2650f5',
+              'krealloc': '0xb1e12d81', 'module_layout': '0x392bc26a',
+              'mutex_lock': '0x2ab7989d', 'mutex_unlock': '0x409bcb62',
+              'of_alias_get_id': '0xd4e71368', 'of_get_next_available_child': '0x64e65b58',
+              'of_modalias_node': '0x7f16941c', 'of_property_read_u64': '0x34abb066',
+              'pm_generic_resume': '0x9d3e14da', 'pm_generic_suspend': '0x6179774c',
+              'printk': '0xc5850110', 'put_device': '0x46bc19b5',
+              'strcmp': '0xe2d5255a', 'strlcpy': '0x5792f848',
+          }
+          crcs = {}
+          for line in open('Module.symvers', encoding='utf-8', errors='replace'):
+              p = line.split()
+              if len(p) >= 2 and p[0].startswith('0x'):
+                  crcs[p[1]] = p[0]
+          ok, bad = 0, []
+          for sym, want in EXPECTED.items():
+              got = crcs.get(sym)
+              if got == want:
+                  ok += 1
+              else:
+                  bad.append((sym, want, got))
+          print(f'CRC 校验: {ok}/{len(EXPECTED)} 通过')
+          for sym, want, got in bad:
+              print(f'  MISS {sym}: 期望 {want} 实际 {got}')
+          if any(s == 'module_layout' for s, _, _ in bad):
+              print('!! module_layout CRC 不匹配 (vendor 模块拒载: disagreements about version of symbol module_layout)')
+              sys.exit(1)
+          print('OK: module_layout CRC 与官方/vendor 一致 (其余 MISS 符号仅告警, 见上方列表)')
+          PYEOF
 
       # ============ 6. 原版 boot.img (缓存) ============
       - name: 恢复原版 boot.img 缓存
@@ -472,4 +543,5 @@ jobs:
             SHA256SUMS.txt
             kernel/arch/arm64/boot/Image
             kernel/.config
+            kernel/Module.symvers
           if-no-files-found: error
