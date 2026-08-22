@@ -444,27 +444,23 @@ jobs:
 
           # ==== [9b] 官方 commit 对照树 ====
           echo "===== [9b] 官方 commit c8c87694a044 对照树 ====="
-          # ★ 必须用 if/else 判断 fetch 真失败 (管道 tail 会掩盖退出码导致 || 失效)
+          # ★ 根治方案: 不拉 git 历史 (浅克隆 fetch 特定 sha / shallow-since /
+          #   unshallow 在 GitHub 上不可靠), 直接用 GitHub archive tarball
+          #   下载官方 commit 完整树 (runner 在 GitHub 内网, github.com 必通)
           OFF_SHA=c8c87694a044c7fb9e10ae580c389dc683c110d1
-          if git fetch origin $OFF_SHA --depth=1 >/tmp/f1.log 2>&1; then
-            echo "fetch sha OK"
-          elif git fetch origin lineage-23.2 --shallow-since=2025-12-01 >/tmp/f2.log 2>&1; then
-            echo "fetch shallow-since OK"
-          else
-            echo "shallow-since FAIL: $(tail -1 /tmp/f2.log)"
-            git fetch --unshallow origin >/tmp/f3.log 2>&1 && echo "unshallow OK" || echo "unshallow FAIL: $(tail -1 /tmp/f3.log)"
-          fi
-          git rev-parse $OFF_SHA^{commit} >/dev/null 2>&1 && echo "对象存在: $OFF_SHA" || echo "!! 对象缺失"
-          rm -rf /tmp/otree
-          if git worktree add --detach /tmp/otree $OFF_SHA >/tmp/wt.log 2>&1; then
-            echo "worktree OK"
-          else
-            echo "worktree FAIL: $(tail -1 /tmp/wt.log) -> git archive"
-            mkdir -p /tmp/otree
-            git archive $OFF_SHA | tar -x -C /tmp/otree 2>/dev/null || echo "!! archive FAIL"
-          fi
           SKIP_OFF=0
+          rm -rf /tmp/otree && mkdir -p /tmp/otree
+          echo "下载官方 commit tarball (约 200-300MB, 1-3 分钟)..."
+          if curl -sL --retry 3 -o /tmp/off.tar.gz \
+              "https://github.com/LineageOS/android_kernel_realme_sm6375/archive/$OFF_SHA.tar.gz"; then
+            echo "tarball 下载完成: $(stat -c%s /tmp/off.tar.gz) bytes"
+            tar -xzf /tmp/off.tar.gz -C /tmp/otree --strip-components=1 2>&1 | tail -2
+          else
+            echo "!! tarball 下载失败 (curl exit $?)"
+            SKIP_OFF=1
+          fi
           if [ -f /tmp/otree/Makefile ]; then
+            echo "官方树就绪 (Makefile 存在)"
             cd /tmp/otree
           else
             echo "!! 官方树不可用, 跳过 [9b] 对照"
