@@ -181,6 +181,17 @@ jobs:
           ls -la drivers/kernelsu/ | head -8
           grep -n "kernelsu" drivers/Makefile
 
+      # ============ 4.4 应用 selinux_hide access 探测过滤 patch (ReSukiSU) ============
+      # 在 my_write_access() 里过滤含 fsck_untrusted / su / adbroot 的 access 查询,
+      # 命中直接返回 -EINVAL, 避免 root 检测工具通过 /sys/fs/selinux/access 探测
+      # fake policy 中的敏感域信息。目标文件属 ReSukiSU 仓库, 故在 KernelSU 目录内 apply。
+      - name: 应用 selinux_hide access 过滤 patch
+        run: |
+          cd kernel/KernelSU
+          patch -p1 < ../../patches/55_add_selinux_hide_access_filter.patch
+          echo "--- 验证过滤已集成 ---"
+          grep -n "fsck_untrusted" kernel/feature/selinux_hide.c
+
       # ============ 4.5 应用 SUSFS 5.4 patch (fs/ 层, 隐藏 SELinux 核心) ============
       # 官方 SUSFS v2.2.0 只有 GKI 5.10 patch。oscar 是高通 5.4 QGKI ——
       # 本仓库已移植为 5.4 版本 (patches/50_add_susfs_in_kernel-5.4.patch)。

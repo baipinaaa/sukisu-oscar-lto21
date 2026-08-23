@@ -1,0 +1,21 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index f92f8a4..32979db 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -243,6 +243,16 @@ static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+     if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
+         goto out;
+ 
++    /*
++     * ReSukiSU: 过滤 root 检测工具的 access 探测查询。
++     * 当 scon/tcon 含 fsck_untrusted / su / adbroot 等敏感上下文关键词时,
++     * 直接返回 -EINVAL (视为非法查询), 避免泄露 fake policy 中的域信息。
++     */
++    if (strstr(scon, "fsck_untrusted") || strstr(tcon, "fsck_untrusted") ||
++        strstr(scon, "adbroot") || strstr(tcon, "adbroot") ||
++        strstr(scon, ":su:") || strstr(tcon, ":su:"))
++        goto out;
++
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+     length = security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL);
+     if (length)
