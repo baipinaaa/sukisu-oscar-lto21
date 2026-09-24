@@ -24,6 +24,9 @@
 #      (patches/50_add_susfs_in_kernel-5.4.patch 必须一起推)
 #   2. Actions 页面 → Build SukiSU LTO21 Kernel for oscar → Run workflow
 #      (los_date 填你手机当前系统 nightly 的日期，必须一致！)
+#      ★ 内核 commit 已随 los_date 同步: 20260921/0914/0907 均对应
+#        84e7d691ee3a094de68628c488847a4dd632e7eb (官方 build-manifest 实测)
+#        换别的 nightly 日期前, 先用 build-manifest.xml 核对内核 revision!
 #   3. 构建完成(约 60-120 分钟, LTO 链接较慢)后下载 artifact: new_boot.img
 #   4. fastboot 双槽刷入 (见 README.md)
 #
@@ -54,7 +57,7 @@ on:
         description: 'LineageOS nightly 日期 YYYYMMDD (必须与你手机当前系统一致!)'
         required: true
         type: string
-        default: '20260817'
+        default: '20260921'
       custom_version:
         description: '自定义版本名 (可选，显示在 uname -r)'
         required: false
@@ -84,23 +87,27 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: kernel
-          # ★ v2: 固定到官方 commit c8c87694a044 (旧缓存是 lineage-23.2 HEAD 树,
-          #   与官方 Image 树不一致导致 CRC 差异, 必须失效)
-          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-c8c87694a044-v2
+          # ★ v3: 固定到官方 commit 84e7d691ee3a (20260921/0914/0907 nightly 官方内核)
+          #   旧缓存 c8c87694a044 是 2026-01-27 的树, 与官方差 1090 个 commit,
+          #   导致 module_layout 等 23 个符号 CRC 差异, 必须失效
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-84e7d691ee3a-v3
 
-      - name: 下载 oscar 内核源码 (LineageOS, 固定官方 commit c8c87694a044)
+      - name: 下载 oscar 内核源码 (LineageOS, 固定官方 commit 84e7d691ee3a)
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
-          # ★ 必须 checkout 到官方 Image 版本串对应的 commit c8c87694a044:
-          #   lineage-23.2 分支 HEAD 比官方 commit 新 (含 seccomp.filter_count /
-          #   bpf android_kabi_reserved* / BPF_PROG_TYPE_FUSE 等字段), 直接 clone
-          #   HEAD 导致 module_layout 等 23 个符号 CRC 与官方不一致
-          #   (run 32550926252 双树诊断实锤: HEAD vs 官方树 .symtypes diff 4~20 行)
+          # ★ 必须 checkout 到官方 nightly 对应的 commit 84e7d691ee3a:
+          #   20260921 / 20260914 / 20260907 三份 build-manifest.xml 均写
+          #     LineageOS/android_kernel_realme_sm6375 revision="84e7d691ee3a094de68628c488847a4dd632e7eb"
+          #   (= lineage-23.2 分支 HEAD, 2026-08-22 "arm64: configs:
+          #    Regenerate Q/GKI holi defconfigs")
+          #   旧值 c8c87694a044 (2026-01-27) 与官方差 1090 个 commit, 导致
+          #   module_layout 等 23 个符号 CRC 与官方 vendor 模块不一致
+          #   (8-17 时期实测: HEAD vs 官方树 .symtypes diff 4~20 行)
           git clone --depth 1 --branch "${{ github.event.inputs.kernel_branch }}" \
             https://github.com/LineageOS/android_kernel_realme_sm6375 kernel
           cd kernel
-          git fetch origin c8c87694a044c7fb9e10ae580c389dc683c110d1 --depth=1
-          git checkout c8c87694a044c7fb9e10ae580c389dc683c110d1
+          git fetch origin 84e7d691ee3a094de68628c488847a4dd632e7eb --depth=1
+          git checkout 84e7d691ee3a094de68628c488847a4dd632e7eb
           echo "内核 commit: $(git rev-parse HEAD)"
           echo "内核分支: ${{ github.event.inputs.kernel_branch }}"
           ls arch/arm64/configs/vendor/ | grep holi
@@ -110,7 +117,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: kernel
-          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-c8c87694a044-v2
+          key: kernel-oscar-lto21-${{ github.event.inputs.kernel_branch }}-84e7d691ee3a-v3
 
       # ============ 2. 编译依赖 ============
       - name: 安装编译依赖
@@ -313,8 +320,8 @@ jobs:
           # ★ LOCALVERSION= 空值 (必须!): CONFIG_LOCALVERSION_AUTO=n 时
           #   scripts/setlocalversion 若发现 LOCALVERSION 环境变量未设置 且 仓库
           #   不在 annotated tag 上 (GitHub 浅克隆必然) -> 自动追加 '+'
-          #   -> UTS_RELEASE/vermagic 变 5.4.302-qgki-gc8c87694a044+ 与官方
-          #   模块 (a044 无+) 不匹配, check_vermagic 拒绝所有 vendor 模块
+          #   -> UTS_RELEASE/vermagic 变 5.4.302-qgki-g84e7d691ee3a+ 与官方
+          #   模块 (84e7d691ee3a 无+) 不匹配, check_vermagic 拒绝所有 vendor 模块
           #   (实测: wifi/蓝牙/音频全挂, run 32489911904)。空值即可 (${LOCALVERSION+set}=set)
           export LOCALVERSION=
           # LLVM=1: 全套 LLVM 工具链 (clang + ld.lld + llvm-ar + llvm-nm + llvm-strip)
@@ -331,7 +338,7 @@ jobs:
             -e KSU_SUSFS_SUS_MAP \
             -d KSU_TRACEPOINT_HOOK \
             -d CONFIG_LOCALVERSION_AUTO \
-            --set-str CONFIG_LOCALVERSION "-qgki-gc8c87694a044" || true
+            --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
           if [ -n "${{ github.event.inputs.custom_version }}" ]; then
             ./scripts/config --set-str LOCALVERSION "-${{ github.event.inputs.custom_version }}"
           fi
@@ -378,7 +385,7 @@ jobs:
           echo "$VER"
           # ★ 版本串验证: 必须与官方完全一致 (无 '+') 否则 vermagic 不匹配
           #   官方模块全被拒 (wifi/蓝牙/音频全挂, run 32489911904 教训)
-          if echo "$VER" | grep -qE 'qgki-gc8c87694a044\+'; then
+          if echo "$VER" | grep -qE 'qgki-g84e7d691ee3a\+'; then
             echo "!! 版本串带 '+', vermagic 与官方模块不匹配, 构建失败"
             exit 1
           fi
@@ -389,30 +396,41 @@ jobs:
           #   我们的 LTO21 内核 module_layout/bus_register/driver_register 等
           #   23 个符号 CRC 不匹配 (涉及 struct module/device/kmem_cache/of 的
           #   展开差异)。这里直接用 Module.symvers 对照官方值 (取自
-          #   vendor swr_dlkm.ko __versions + 官方 boot.img __kcrctab 反查,
-          #   40 个符号 40/40 实证一致)。module_layout 不匹配立即失败。
+          #   vendor swr_dlkm.ko __versions + 官方 boot.img __kcrctab 反查)。
+          # ★ 2026-09-24 更新: 官方内核换到 84e7d691ee3a (20260921 nightly),
+          #   40 个符号中 17 个未变、23 个已变 (根因: 8-22 commit
+          #   "arm64: configs: Regenerate Q/GKI holi defconfigs" 改了
+          #   holi-qgki_defconfig -> struct 展开变化)。
+          #   新值从 20260921 官方 boot.img 的 __kcrctab 反查:
+          #     vaddr = 0xffffffc010080000 + file_off;
+          #     同一符号满足 6*Y - P = const (P=__ksymtab 项地址, Y=__kcrctab 项地址),
+          #     17 个旧值命中锚点定出 const = 0xb74cb30, 再由 const 解出 23 个
+          #     MISS 符号的新 Y 位置读 CRC;
+          #     交叉验证: 40/40 项的 __ksymtab value 字段均为合法 vaddr;
+          #     且算出的 module_layout=0x32aa09e1 与 8-17 时期 HEAD 树实测值吻合。
+          #   module_layout 不匹配立即失败。
           python3 - <<'PYEOF'
           import sys
           EXPECTED = {
-              '__cfi_slowpath': '0x2cd90edd', '__devm_regmap_init': '0x5b50214e',
+              '__cfi_slowpath': '0x2cd90edd', '__devm_regmap_init': '0xf813045f',
               '__kmalloc': '0xeb233a45', '__list_add_valid': '0x68f31cbd',
               '__list_del_entry_valid': '0xe1537255', '__mutex_init': '0x977f511b',
-              '__regmap_init': '0xd2ca9c4f', '__stack_chk_fail': '0xf0fdf6cb',
-              '__stack_chk_guard': '0x8f678b07', '_dev_err': '0xd72f0f38',
-              'bus_register': '0xccd0b4a3', 'bus_unregister': '0x3ecd980d',
-              'dev_get_regmap': '0xde1c7ffb', 'dev_set_name': '0xf7079be9',
-              'device_for_each_child': '0x552d9990', 'device_register': '0x43ca8ed5',
-              'device_unregister': '0x070f701b', 'driver_register': '0xa1e3d6b3',
-              'driver_unregister': '0x66e29c37', 'get_device': '0x3e9a0de0',
+              '__regmap_init': '0xc2cfe3d6', '__stack_chk_fail': '0xf0fdf6cb',
+              '__stack_chk_guard': '0x8f678b07', '_dev_err': '0xf58b10d2',
+              'bus_register': '0x16fd06ab', 'bus_unregister': '0x6025f0e2',
+              'dev_get_regmap': '0x2ef6d2f9', 'dev_set_name': '0x40ab455d',
+              'device_for_each_child': '0x0543f71d', 'device_register': '0x4c8a95b7',
+              'device_unregister': '0x98be9da8', 'driver_register': '0xd83b86f9',
+              'driver_unregister': '0xacfc56f9', 'get_device': '0x9f76c44c',
               'idr_alloc': '0xb8f11603', 'idr_find': '0x20978fb9',
               'idr_remove': '0x7665a95b', 'kfree': '0x037a0cba',
-              'kmalloc_caches': '0x91ea9a65', 'kmem_cache_alloc_trace': '0x4a2650f5',
-              'krealloc': '0xb1e12d81', 'module_layout': '0x392bc26a',
+              'kmalloc_caches': '0x41bdb885', 'kmem_cache_alloc_trace': '0x3d9902e6',
+              'krealloc': '0xb1e12d81', 'module_layout': '0x32aa09e1',
               'mutex_lock': '0x2ab7989d', 'mutex_unlock': '0x409bcb62',
-              'of_alias_get_id': '0xd4e71368', 'of_get_next_available_child': '0x64e65b58',
-              'of_modalias_node': '0x7f16941c', 'of_property_read_u64': '0x34abb066',
-              'pm_generic_resume': '0x9d3e14da', 'pm_generic_suspend': '0x6179774c',
-              'printk': '0xc5850110', 'put_device': '0x46bc19b5',
+              'of_alias_get_id': '0x43aadc47', 'of_get_next_available_child': '0xe6ba705e',
+              'of_modalias_node': '0xf993cc8e', 'of_property_read_u64': '0x37dfa3a3',
+              'pm_generic_resume': '0xdc98fa9e', 'pm_generic_suspend': '0xad5ff920',
+              'printk': '0xc5850110', 'put_device': '0x23e50e24',
               'strcmp': '0xe2d5255a', 'strlcpy': '0x5792f848',
           }
           crcs = {}
@@ -436,16 +454,21 @@ jobs:
           print('OK: module_layout CRC 与官方/vendor 一致 (其余 MISS 符号仅告警, 见上方列表)')
           PYEOF
 
-      # ============ 6.5 genksyms 双树诊断 (定位 module_layout CRC 差异根因) ============
-      # ★ 背景: 官方 Image 的 module_layout=0x392bc26a, 我们 LTO21 实测 0x32aa09e1。
-      #   静态排查已排除 config(官方=LTO21 子集)/树(284 文件 include 图仅 4 无关 DIFF)/编译器(clang21 同源)。
-      #   本步骤做决定性对照实验: 官方 commit c8c87694a044 纯树 + 我们的 .config + 我们的 clang21,
-      #   重跑 module.o 等 4 个文件的 genksyms (KBUILD_SYMTYPES=1 生成 .symtypes):
-      #     - 若官方纯树也得到 0x32aa09e1 -> 官方 Image 含本地修改(非纯树) -> 走 CRC 强制覆盖方案
-      #     - 若官方纯树得到 0x392bc26a -> 树/config 差异 -> diff .symtypes 直接定位差异 token
-      #   即使上一步 CRC 校验失败也要执行 (诊断必须跑) -> if: always()
-      - name: genksyms 双树诊断 (HEAD vs 官方commit c8c87694a044)
-        if: always()
+      # ============ 6.5 genksyms 双树诊断 (仅在前面步骤失败时运行) ============
+      # ★ 背景: 8-17 时期官方 Image (c8c87694a044 树) 的 module_layout=0x392bc26a,
+      #   而我们当时用 lineage-23.2 HEAD 树实测 0x32aa09e1 —— 由此做了本诊断:
+      #   官方 commit 纯树 + 我们的 .config + 我们的 clang21, 重跑 module.o 等
+      #   4 个文件的 genksyms (KBUILD_SYMTYPES=1 生成 .symtypes) 对比:
+      #     - 官方纯树也得到同一值 -> 官方 Image 含本地修改(非纯树) -> 走 CRC 强制覆盖方案
+      #     - 官方纯树得到官方值     -> 树/config 差异 -> diff .symtypes 直接定位差异 token
+      # ★ 2026-09-24: 官方内核已改用 84e7d691ee3a (= lineage-23.2 HEAD, 2026-08-22
+      #   "arm64: configs: Regenerate Q/GKI holi defconfigs"), 我们 checkout 的就是
+      #   官方树, "树不一致" 这一根因已消除; 且官方 Image 的 module_layout 现在是
+      #   0x32aa09e1 (与旧 HEAD 树实测值一致, 已由 20260921 官方 boot.img 反查确认)。
+      #   因此本诊断不再每次运行 (原 if: always() 每次白下载 200-300MB tarball +
+      #   双份编译), 改为仅在前面步骤失败时运行, 保留定位能力。
+      - name: genksyms 双树诊断 (HEAD vs 官方commit 84e7d691ee3a)
+        if: failure()
         run: |
           set -x
           export PATH=$GITHUB_WORKSPACE/clang/${{ env.CLANG_VER }}/bin:$PATH
@@ -465,11 +488,11 @@ jobs:
           grep "module_layout" Module.symvers
 
           # ==== [9b] 官方 commit 对照树 ====
-          echo "===== [9b] 官方 commit c8c87694a044 对照树 ====="
           # ★ 根治方案: 不拉 git 历史 (浅克隆 fetch 特定 sha / shallow-since /
           #   unshallow 在 GitHub 上不可靠), 直接用 GitHub archive tarball
           #   下载官方 commit 完整树 (runner 在 GitHub 内网, github.com 必通)
-          OFF_SHA=c8c87694a044c7fb9e10ae580c389dc683c110d1
+          OFF_SHA=84e7d691ee3a094de68628c488847a4dd632e7eb
+          echo "===== [9b] 官方 commit $OFF_SHA 对照树 ====="
           SKIP_OFF=0
           rm -rf /tmp/otree && mkdir -p /tmp/otree
           echo "下载官方 commit tarball (约 200-300MB, 1-3 分钟)..."
@@ -523,10 +546,10 @@ jobs:
             echo "判定: 官方树不可用 (fetch/worktree 失败) -> 无对照数据, 检查上方日志"
           else
             D=$(wc -l < /tmp/diff_module.txt 2>/dev/null || echo 9999)
-            echo "module.symtypes diff 行数: $D (官方Image module_layout=0x392bc26a, HEAD实测=0x32aa09e1)"
+            echo "module.symtypes diff 行数: $D (官方Image module_layout=0x32aa09e1)"
             if [ "$D" = "0" ]; then
               echo "判定: HEAD == 官方纯树 (checkout 已生效, 构建树 == 官方 Image 树)"
-              echo "      -> 若上方 CRC 校验仍失败, 则官方 Image 含本地修改(非纯 c8c87694a044)"
+              echo "      -> 若上方 CRC 校验仍失败, 则官方 Image 含本地修改(非纯 84e7d691ee3a)"
               echo "      -> 走 CRC 强制覆盖方案 (改 genksyms 对 MISS 符号输出固定 CRC)"
             else
               echo "判定: 仍有树差异 -> 看上方 diff 定位修复"

@@ -17,7 +17,7 @@ CONFIG_LOCALVERSION="-qgki"   CONFIG_LOCALVERSION_AUTO=y
 配合官方 boot.img 版本串：
 
 ```
-Linux version 5.4.302-qgki-gc8c87694a044 (root@3c794f190b77)
+Linux version 5.4.302-qgki-g84e7d691ee3a (root@3c794f190b77)
 (Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c)
  clang version 21.0.0 (...), LLD 21.0.0 (...))
 ```
@@ -62,7 +62,7 @@ make LLVM=1 ARCH=arm64 KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_d
   -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
   -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
   -e KSU_SUSFS_SUS_MAP -d KSU_TRACEPOINT_HOOK \
-  -d CONFIG_LOCALVERSION_AUTO --set-str CONFIG_LOCALVERSION "-qgki-gc8c87694a044"
+  -d CONFIG_LOCALVERSION_AUTO --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a"
 make LLVM=1 ARCH=arm64 olddefconfig
 
 # 编译
@@ -98,7 +98,7 @@ grep -E "CONFIG_LTO|CONFIG_CFI|CONFIG_THINLTO|CONFIG_LD_IS_LLD" .config
 | CONFIG_HAVE_ARCH_PREL32_RELOCATIONS | 无 | 无 PREL32 |
 | CONFIG_MODVERSIONS | y | CRC 校验 |
 | CONFIG_KPROBES | y | **kprobe 可用 (SUSFS 依赖)** |
-| CONFIG_LOCALVERSION | "-qgki" + AUTO | 最终 -qgki-gc8c87694a044 |
+| CONFIG_LOCALVERSION | "-qgki" + AUTO | 最终 -qgki-g84e7d691ee3a |
 
 ### 2. ReSukiSU 与 CFI 兼容性 (已验证源码)
 
@@ -157,48 +157,106 @@ grep -E "CONFIG_LTO|CONFIG_CFI|CONFIG_THINLTO|CONFIG_LD_IS_LLD" .config
 
 ### 7. 版本号 / vermagic
 
-- 保持 `CONFIG_LOCALVERSION="-qgki-gc8c87694a044"` (写死官方串) +
+- 保持 `CONFIG_LOCALVERSION="-qgki-g84e7d691ee3a"` (写死官方串) +
   `-d CONFIG_LOCALVERSION_AUTO` → vermagic 与官方一致
-  (`5.4.302-qgki-gc8c87694a044 SMP preempt mod_unload modversions aarch64`)。
+  (`5.4.302-qgki-g84e7d691ee3a SMP preempt mod_unload modversions aarch64`)。
 - LTO/CFI 编译后 struct module 布局与官方一致 → module_layout CRC 自动匹配，
   不需要 60_ patch 跳 CRC。
 
-### 8. module_layout CRC 校验 (本轮新增, 见 workflow 编译步骤尾部)
+### 8. Module.symvers CRC 校验 (workflow 编译步骤尾部)
 
 **背景**：run 32489911904 的 Image 中 vendor 模块被拒 (`disagrees about
-version of symbol module_layout`)。三方 CRC 实证：
+version of symbol module_layout`)。workflow 因此在编译步骤尾部加了
+**Module.symvers CRC 校验**：40 个符号对照官方值，`module_layout`
+不匹配立即失败；artifact 一并上传 `kernel/Module.symvers` 供失败分析。
 
-- vendor swr_dlkm.ko `__versions`: `module_layout=0x392bc26a` (64B/条)
-- 官方 boot.img `__kcrctab` @0x2475ce8 = `0x392bc26a` (40 符号 40/40 一致)
-- LTO21 Image 全镜像 43MB 内 `0x392bc26a` **0 命中** (17/40 HIT)
+**40 个符号清单来源**：vendor `swr_dlkm.ko` 的 `__versions` 段
+（64B/条），再用官方 boot.img 的 `__kcrctab` 反查补全。
 
-**MISS 规律**：MISS 的 23 个符号全部涉及 `struct module / device /
-bus_type / device_driver / kmem_cache / device_node` 展开；HIT 的 17 个
-都是基本类型/小结构 (mutex/list/idr/void*)。
+#### 8.1 内核 revision 变更导致的 CRC 变化 (2026-09-24 更新)
 
-**静态排查全部一致**（排除了源码/config 差异）：
+| nightly | 官方内核 revision | 树日期 | module_layout |
+|---|---|---|---|
+| 20260817（手机当前） | `c8c87694a044` | 2026-01-27 | `0x392bc26a` |
+| 20260921 / 0914 / 0907 | `84e7d691ee3a` | 2026-08-22 | `0x32aa09e1` |
 
-- 本地树 module.h/device.h/kobject.h/kernfs.h/slab.h/of.h 等 46 个头
-  == 官方 commit `c8c87694a044`（jsdelivr CDN 拉取，diff 0 行）
-- kernel/module.c == 官方（diff 0）；284 文件 include 图地毯式对比
-  （构建树=分支 HEAD vs 官方 commit）仅 4 个 DIFF：seccomp.h×2 /
-  random.h / asm/seccomp.h + Makefile——**全不在 struct 展开树内**
-- config 地毯式全一致（SLUB/SLAB_FREELIST_HARDENED/ACPI/DMA_CMA/
-  GENERIC_MSI_IRQ_DOMAIN/OF 系列/PM 系列/DEBUG_KOBJECT_RELEASE/…100+ 项）
-- KCFLAGS `-I.` 无影响（ABI 头全尖括号 include，根目录无伪头）
-- SUSFS patch / KSU 集成不碰任何 ABI 头；KSU Kconfig 仅 select KALLSYMS
-- 编译器同 llvm-project commit 5e96669f（r563880c vs r563880 仅 build 号）
+> `84e7d691ee3a` = `lineage-23.2` 分支 HEAD，commit message
+> "arm64: configs: Regenerate Q/GKI holi defconfigs"。
+> 两 revision 相差 **1090 个 commit**。
 
-**结论**：静态层面 CRC 必须一致但实测不同 → 差异在**构建时环境**
-（旧 run 的 workflow/缓存/工具链细节，无法静态复现）。因此 workflow
-在编译步骤尾部新增 **Module.symvers CRC 校验**：40 个符号对照官方值
-（取自 swr_dlkm.ko `__versions`），`module_layout` 不匹配立即失败；
-且 artifact 上传 `kernel/Module.symvers` 供失败后精确分析。
+**40 个符号中 17 个未变、23 个已变**。变动的 23 个：
+
+```
+__devm_regmap_init       0x5b50214e -> 0xf813045f
+__regmap_init            0xd2ca9c4f -> 0xc2cfe3d6
+_dev_err                 0xd72f0f38 -> 0xf58b10d2
+bus_register             0xccd0b4a3 -> 0x16fd06ab
+bus_unregister           0x3ecd980d -> 0x6025f0e2
+dev_get_regmap           0xde1c7ffb -> 0x2ef6d2f9
+dev_set_name             0xf7079be9 -> 0x40ab455d
+device_for_each_child    0x552d9990 -> 0x0543f71d
+device_register          0x43ca8ed5 -> 0x4c8a95b7
+device_unregister        0x070f701b -> 0x98be9da8
+driver_register          0xa1e3d6b3 -> 0xd83b86f9
+driver_unregister        0x66e29c37 -> 0xacfc56f9
+get_device               0x3e9a0de0 -> 0x9f76c44c
+kmalloc_caches           0x91ea9a65 -> 0x41bdb885
+kmem_cache_alloc_trace   0x4a2650f5 -> 0x3d9902e6
+module_layout            0x392bc26a -> 0x32aa09e1
+of_alias_get_id          0xd4e71368 -> 0x43aadc47
+of_get_next_available_child 0x64e65b58 -> 0xe6ba705e
+of_modalias_node         0x7f16941c -> 0xf993cc8e
+of_property_read_u64     0x34abb066 -> 0x37dfa3a3
+pm_generic_resume        0x9d3e14da -> 0xdc98fa9e
+pm_generic_suspend       0x6179774c -> 0xad5ff920
+put_device               0x46bc19b5 -> 0x23e50e24
+```
+
+未变的 17 个（基本类型/小结构，不受 defconfig 影响）：
+`__cfi_slowpath` `__kmalloc` `__list_add_valid` `__list_del_entry_valid`
+`__mutex_init` `__stack_chk_fail` `__stack_chk_guard` `idr_alloc`
+`idr_find` `idr_remove` `kfree` `krealloc` `mutex_lock` `mutex_unlock`
+`printk` `strcmp` `strlcpy`
+
+**根因**：`84e7d691ee3a` 的 "Regenerate Q/GKI holi defconfigs" 改了
+`holi-qgki_defconfig`，配置差异传导到 `struct module / device / bus_type /
+device_driver / kmem_cache / device_node` 的 genksyms 展开 → CRC 变。
+
+> 8-17 时期的静态排查已排除源码树差异，当时留下的谜团
+> "实测 0x32aa09e1 ≠ 官方 0x392bc26a" 现在解释清楚了：我们当时用的是
+> HEAD 树（= 新 defconfig），而官方 8-17 nightly 用的是旧 defconfig。
+> **当时实测的 0x32aa09e1 与现在官方 9-21 的值完全吻合**，反向印证了
+> 本次反查的正确性。
+
+#### 8.2 新 CRC 的反查方法 (20260921 官方 boot.img)
+
+```
+1. 从 boot.img 取出 kernel Image (43,493,888 B)
+2. vaddr 映射: vaddr = 0xffffffc010080000 + file_off
+3. 关键恒等式: 对同一符号, 6*Y - P = const
+     P = __ksymtab   项文件偏移 (24B/项: value, name, namespace)
+     Y = __kcrctab   项文件偏移 (4B/项)
+   (因 __ksymtab/_gpl 与 __kcrctab/_gpl 紧邻无 padding, 两表 const 相同)
+4. 用 17 个"旧值命中"的锚点 (在 Image 内直接搜到旧 CRC, 且反推出
+   __ksymtab 引用位置) 定出 const = 0xb74cb30 —— 17/17 一致
+5. 由 const 反解 23 个 MISS 符号的 Y, 读出新 CRC (每个符号唯一候选)
+6. 交叉验证:
+   - 40/40 项的 __ksymtab value 字段均为合法 vaddr (0/40 非法)
+   - 17 未变 / 23 已变 与 "直接搜到/搜不到" 的 HIT/MISS 分布完全吻合
+   - module_layout=0x32aa09e1 == 8-17 时期 HEAD 树实测值
+```
+
+反查脚本与本轮产物留在 `../_crc921/`（`final_crc.py` / `verify.py` /
+`verify_value.py` / `kernel_921.raw`）。
+
+**残留风险**：新值是反查所得（非官方直接给出）。若某个值有误，workflow
+的 CRC 校验会在 `module_layout` 不匹配时**立即失败**（不会产出坏内核），
+届时用 artifact 里的 `kernel/Module.symvers` 与官方值对照即可修正。
 
 ## 验证点 (编译后)
 
 0. **Module.symvers 校验**：workflow 自动对比 40 个关键符号 CRC
-   （期望 `module_layout=0x392bc26a`，不匹配构建直接失败）
+   （20260921 对应期望 `module_layout=0x32aa09e1`，不匹配构建直接失败）
 1. `.config` 确认 `CONFIG_LTO_CLANG=y` + `CONFIG_CFI_CLANG=y` +
    `CONFIG_THINLTO=y` + `CONFIG_LD_IS_LLD=y` (workflow 自动检查)
 2. `strings Image | grep "Linux version"` 应显示 clang 21 + LLD 21
@@ -207,26 +265,35 @@ bus_type / device_driver / kmem_cache / device_node` 展开；HIT 的 17 个
 4. `lsmod` 应出现 btpower/adsp/q6/wcd938x 等音频蓝牙模块
 5. `cat /proc/kallsyms | grep swr_driver_register` 应能解析到地址
 
-## genksyms 双树诊断 (workflow 步骤 17, 新增)
+## genksyms 双树诊断 (workflow 步骤 6.5, 仅失败时运行)
 
-背景：官方 Image 的 `module_layout=0x392bc26a`，LTO21 实测 `0x32aa09e1`。
-静态排查已排除 config（官方=LTO21 子集）、树（284 文件 include 图仅
-4 个无关 DIFF）、编译器（官方 boot.img 实证也是 clang 21.0.0 r563880c，
-llvm-project commit 5e96669f 同源）。
+**背景（8-17 时期）**：官方 Image (c8c87694a044 树) 的
+`module_layout=0x392bc26a`，而我们用 lineage-23.2 HEAD 树实测
+`0x32aa09e1`。静态排查已排除 config（官方=LTO21 子集）、树（284 文件
+include 图仅 4 个无关 DIFF）、编译器（官方 boot.img 实证也是 clang
+21.0.0 r563880c，llvm-project commit 5e96669f 同源）。
 
-本步骤做**决定性对照实验**（`if: always()` 即使 CRC 校验失败也执行）：
+本步骤做**决定性对照实验**：官方 commit 纯树 + 我们的 `.config` +
+我们的 clang21，重跑 `kernel/module.o`、`printk.o`、`slab_common.o`、
+`drivers/base/core.o` 的 genksyms（`KBUILD_SYMTYPES=1` → `.symtypes`）：
 
 ```
-[9a] HEAD 树: KBUILD_SYMTYPES=1 重编 kernel/module.o、printk.o、
-     slab_common.o、drivers/base/core.o → 4 个 .symtypes
-[9b] 官方 commit c8c87694a044 纯树 (git worktree) + 我们的 .config +
+[9a] HEAD 树: KBUILD_SYMTYPES=1 重编上述 4 个文件 → 4 个 .symtypes
+[9b] 官方 commit 纯树 (GitHub archive tarball 下载) + 我们的 .config +
      我们的 clang21 → 同样 4 个 .symtypes + Module.symvers
 [9c] diff 每对 .symtypes → 差异 token 直接可见
 [9d] 判定:
-     · 官方纯树 = 0x392bc26a → 差异在 HEAD 树/config → diff 定位修复
-     · 官方纯树 = 0x32aa09e1 → 官方 Image 含本地修改 (非纯树)
+     · 官方纯树 = 官方值   → 差异在 HEAD 树/config → diff 定位修复
+     · 官方纯树 = 我们的值 → 官方 Image 含本地修改 (非纯树)
        → 后续走 CRC 强制覆盖方案 (改 genksyms 输出固定 CRC)
 ```
+
+**2026-09-24 变更**：官方内核已改用 `84e7d691ee3a`（= `lineage-23.2`
+HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消除；且官方
+9-21 的 `module_layout` 现在是 `0x32aa09e1`（已由 20260921 官方 boot.img
+反查确认）。因此该步骤由 `if: always()` 改为 **`if: failure()`** ——
+不再每次白下载 200-300MB tarball + 双份编译，仅在前面步骤失败时运行，
+保留定位能力。
 
 诊断产物（head_*.symtypes / off_*.symtypes / diff_*.txt）随 artifact 上传，
 供本地精确分析。
