@@ -1090,7 +1090,7 @@ diff -ruN orig/fs/proc/cmdline.c mod/fs/proc/cmdline.c
  	return 0;
 diff -ruN orig/fs/proc/fd.c mod/fs/proc/fd.c
 --- a/fs/proc/fd.c	2026-09-24 21:02:18.696949000 +0800
-+++ b/fs/proc/fd.c	2026-09-24 21:02:18.776821300 +0800
++++ b/fs/proc/fd.c	2026-09-24 21:29:47.421647900 +0800
 @@ -13,17 +13,35 @@
  #include <linux/fs.h>
  
@@ -1127,9 +1127,9 @@ diff -ruN orig/fs/proc/fd.c mod/fs/proc/fd.c
  
  	task = get_proc_task(m->private);
  	if (!task)
-@@ -59,6 +77,71 @@
- 		   real_mount(file->f_path.mnt)->mnt_id,
- 		   file_inode(file)->i_ino);
+@@ -54,10 +72,70 @@
+ 	if (ret)
+ 		return ret;
  
 +#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 +	mnt = real_mount(file->f_path.mnt);
@@ -1190,15 +1190,14 @@ diff -ruN orig/fs/proc/fd.c mod/fs/proc/fd.c
 +
 +bypass_orig_flow:
 +#else
-+	seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-+		   (long long)file->f_pos, f_flags,
-+		   real_mount(file->f_path.mnt)->mnt_id,
-+		   file_inode(file)->i_ino);
+ 	seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
+ 		   (long long)file->f_pos, f_flags,
+ 		   real_mount(file->f_path.mnt)->mnt_id,
+ 		   file_inode(file)->i_ino);
 +#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-+
+ 
  	show_fd_locks(m, file, files);
  	if (seq_has_overflowed(m))
- 		goto out;
 diff -ruN orig/fs/proc/task_mmu.c mod/fs/proc/task_mmu.c
 --- a/fs/proc/task_mmu.c	2026-08-21 13:08:26.084364700 +0800
 +++ b/fs/proc/task_mmu.c	2026-08-21 13:50:22.525716600 +0800
