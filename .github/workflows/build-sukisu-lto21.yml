@@ -656,14 +656,7 @@ jobs:
           # "Cannot load Android system. Your data may be corrupt"。
           # 官方 boot.img(LineageOS nightly) 实测就是 header_version=3。
           # 改为直接从原 boot.img 二进制读 header 字段，不依赖 unpack_bootimg.py 的文本输出文件。
-          read -r HDR_VER OS_VER OS_PATCH <<< "$(python3 -c "
-import struct
-d = open('boot.img','rb').read()
-ov = struct.unpack('<I', d[16:20])[0]
-print(struct.unpack('<I', d[40:44])[0],
-      '%d.%d.%d' % ((ov >> 25) & 0x7f, (ov >> 18) & 0x7f, (ov >> 11) & 0x7f),
-      '%04d-%02d' % (2000 + ((ov >> 4) & 0x7f), ov & 0xf))
-")"
+          read -r HDR_VER OS_VER OS_PATCH <<< "$(python3 -c "import struct;d=open('boot.img','rb').read();ov=struct.unpack('<I',d[16:20])[0];print(struct.unpack('<I',d[40:44])[0], '%d.%d.%d'%((ov>>25)&0x7f,(ov>>18)&0x7f,(ov>>11)&0x7f), '%04d-%02d'%(2000+((ov>>4)&0x7f),ov&0xf))")"
           echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
           if [ "$HDR_VER" != "3" ]; then
             echo "::error::原 boot.img header_version=$HDR_VER (预期 3)，中止"
@@ -679,15 +672,7 @@ print(struct.unpack('<I', d[40:44])[0],
           # 填充到原 boot.img 的完整大小(= boot 分区大小 160MB)。
           # 官方 boot.img 本身就是完整分区镜像，尾部是零填充 + AVB footer；
           # 只写 45MB 会在分区尾部残留上次刷入的旧 AVB footer/旧数据，干扰引导。
-          python3 -c "
-import os
-src, dst = 'boot.img', 'new_boot.img'
-t = os.path.getsize(src)
-d = open(dst,'rb').read()
-if len(d) < t:
-    open(dst,'wb').write(d + b'\x00'*(t-len(d)))
-print('new_boot.img ->', os.path.getsize(dst), 'bytes (target', t, ')')
-"
+          python3 -c "import os;t=os.path.getsize('boot.img');d=open('new_boot.img','rb').read();open('new_boot.img','wb').write(d+b'\x00'*(t-len(d))) if len(d)<t else None;print('new_boot.img ->', os.path.getsize('new_boot.img'), 'bytes (target', t, ')')"
           echo "=== 打包完成 ==="
           ls -la new_boot.img
 
@@ -697,15 +682,7 @@ print('new_boot.img ->', os.path.getsize(dst), 'bytes (target', t, ')')
           echo "原 boot 内核大小: $(stat -c%s boot_split/kernel)"
           echo "新 boot 内核大小: $(stat -c%s new_split/kernel)"
           # ⚠️ 必须校验 header_version=3，否则刷入会进 recovery
-          python3 -c "
-import struct
-d = open('new_boot.img','rb').read()
-hv = struct.unpack('<I', d[40:44])[0]
-print('new_boot.img header_version:', hv)
-print('new_boot.img size:', len(d))
-assert hv == 3, 'header_version 必须是 3，实际 %d' % hv
-print('OK: header_version 校验通过')
-"
+          python3 -c "import struct;d=open('new_boot.img','rb').read();hv=struct.unpack('<I',d[40:44])[0];print('new_boot.img header_version:',hv);print('new_boot.img size:',len(d));assert hv==3,'header_version must be 3, got %d'%hv;print('OK: header_version check passed')"
           echo "new_boot.img MD5: $(md5sum new_boot.img)"
           sha256sum new_boot.img > SHA256SUMS.txt
 
