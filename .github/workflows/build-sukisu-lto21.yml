@@ -68,6 +68,11 @@ on:
         required: true
         type: boolean
         default: true
+      resukisu_ref:
+        description: 'ReSukiSU 版本钉扎 (commit SHA / tag)。默认 b2ac2fc8 = 20260817 已验证可启动的 v4.2.0-rc1；填 latest 用最新版（v4.2.0-rc3 实测无法启动）'
+        required: false
+        type: string
+        default: 'b2ac2fc8703ce9f5226e2a38a59f8b72f8a3005c'
 
 env:
   DEVICE: 'oscar'
@@ -178,7 +183,16 @@ jobs:
           rm -rf KernelSU
           git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
           cd KernelSU
-          echo "ReSukiSU commit: $(git log --oneline -1)"
+          # ★ 版本钉扎: 20260921 构建因 clone 到最新版 (fa8311f6, v4.2.0-rc3) 而无法启动;
+          #   b2ac2fc8 (v4.2.0-rc1) 是 20260817 已验证能启动的版本。
+          #   保留全量历史以便 checkout 任意 commit; resukisu_ref=latest 则用默认分支最新提交。
+          REF="${{ github.event.inputs.resukisu_ref }}"
+          if [ -n "$REF" ] && [ "$REF" != "latest" ]; then
+            git checkout "$REF"
+          fi
+          echo "ReSukiSU commit : $(git log --oneline -1)"
+          echo "ReSukiSU date   : $(git log -1 --format=%cd --date=short)"
+          echo "ReSukiSU commit#: $(git rev-list --count HEAD)"
           ls kernel/Kbuild kernel/Kconfig kernel/selinux/selinux.c && echo "结构正确 (kernel/ 目录)"
           cd ..
           ln -sfn "$(realpath --relative-to=drivers KernelSU/kernel)" drivers/kernelsu
