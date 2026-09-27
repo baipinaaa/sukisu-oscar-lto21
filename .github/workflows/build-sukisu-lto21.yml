@@ -650,10 +650,25 @@ jobs:
           git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
           python3 mkbootimg/unpack_bootimg.py --boot_img boot.img --out boot_split
           ls boot_split/
-          OS_VER=$(cat boot_split/os_version 2>/dev/null || echo "16.0.0")
-          OS_PATCH=$(cat boot_split/os_patch_level 2>/dev/null || echo "2026-08")
-          HDR_VER=$(cat boot_split/header_version 2>/dev/null || echo "4")
+          # ⚠️ 关键修复(2026-09-27)：Realme RMX3478 的 bootloader 只接受 header_version=3。
+          # 原先 `HDR_VER=$(cat boot_split/header_version || echo "4")` 的兜底默认值 "4"
+          # 使产物变成 v4，刷入后进 recovery 报
+          # "Cannot load Android system. Your data may be corrupt"。
+          # 官方 boot.img(LineageOS nightly) 实测就是 header_version=3。
+          # 改为直接从原 boot.img 二进制读 header 字段，不依赖 unpack_bootimg.py 的文本输出文件。
+          read -r HDR_VER OS_VER OS_PATCH <<< "$(python3 -c "
+import struct
+d = open('boot.img','rb').read()
+ov = struct.unpack('<I', d[16:20])[0]
+print(struct.unpack('<I', d[40:44])[0],
+      '%d.%d.%d' % ((ov >> 25) & 0x7f, (ov >> 18) & 0x7f, (ov >> 11) & 0x7f),
+      '%04d-%02d' % (2000 + ((ov >> 4) & 0x7f), ov & 0xf))
+")"
           echo "os_version=$OS_VER os_patch=$OS_PATCH header=$HDR_VER"
+          if [ "$HDR_VER" != "3" ]; then
+            echo "::error::原 boot.img header_version=$HDR_VER (预期 3)，中止"
+            exit 1
+          fi
           python3 mkbootimg/mkbootimg.py \
             --kernel kernel/arch/arm64/boot/Image \
             --ramdisk boot_split/ramdisk \
@@ -661,6 +676,18 @@ jobs:
             --header_version $HDR_VER \
             --os_version "$OS_VER" --os_patch_level "$OS_PATCH" \
             -o new_boot.img
+          # 填充到原 boot.img 的完整大小(= boot 分区大小 160MB)。
+          # 官方 boot.img 本身就是完整分区镜像，尾部是零填充 + AVB footer；
+          # 只写 45MB 会在分区尾部残留上次刷入的旧 AVB footer/旧数据，干扰引导。
+          python3 -c "
+import os
+src, dst = 'boot.img', 'new_boot.img'
+t = os.path.getsize(src)
+d = open(dst,'rb').read()
+if len(d) < t:
+    open(dst,'wb').write(d + b'\x00'*(t-len(d)))
+print('new_boot.img ->', os.path.getsize(dst), 'bytes (target', t, ')')
+"
           echo "=== 打包完成 ==="
           ls -la new_boot.img
 
@@ -669,6 +696,16 @@ jobs:
           python3 mkbootimg/unpack_bootimg.py --boot_img new_boot.img --out new_split
           echo "原 boot 内核大小: $(stat -c%s boot_split/kernel)"
           echo "新 boot 内核大小: $(stat -c%s new_split/kernel)"
+          # ⚠️ 必须校验 header_version=3，否则刷入会进 recovery
+          python3 -c "
+import struct
+d = open('new_boot.img','rb').read()
+hv = struct.unpack('<I', d[40:44])[0]
+print('new_boot.img header_version:', hv)
+print('new_boot.img size:', len(d))
+assert hv == 3, 'header_version 必须是 3，实际 %d' % hv
+print('OK: header_version 校验通过')
+"
           echo "new_boot.img MD5: $(md5sum new_boot.img)"
           sha256sum new_boot.img > SHA256SUMS.txt
 
