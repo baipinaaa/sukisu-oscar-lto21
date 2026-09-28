@@ -297,6 +297,16 @@ jobs:
           grep -n "ksu_handle_stat(int \*dfd, struct filename \*\*filename" fs/stat.c
           grep -n "ksu_handle_stat(&dfd, &fname, &flags)" fs/stat.c
           grep -n "ksu_handle_sys_read(fd, &buf, &count)" fs/read_write.c
+          # ★ 确认内核确实提供 filename_lookup()。它在本树里是**全局函数**,
+          #   但只声明在 fs/internal.h (fs/ 私有头), 不在 include/linux/namei.h。
+          #   50_ patch 采用的方案是「fs/stat.c 已 include 不了它 就在文件内自补 extern 声明」;
+          #   若换内核树后这里 grep 不到, 说明 API 变了, 必须重新适配 (否则报
+          #   implicit declaration of function 'filename_lookup' 而中断编译)。
+          echo "--- 确认内核提供 filename_lookup (5.4 未在 namei.h 暴露) ---"
+          grep -n "^extern int filename_lookup" fs/internal.h
+          grep -n "^int filename_lookup(int dfd, struct filename \*name, unsigned flags," fs/namei.c
+          # fs/open.c 需要它自己 include "internal.h" 才能拿到声明 (fs/stat.c 靠自补 extern)
+          grep -n '^#include "internal.h"' fs/open.c
           echo "sucompat ABI 校验通过 (内核侧)"
 
       # ============ 4.6 可选: CFI 关闭时提供假 __cfi_slowpath ============

@@ -1864,7 +1864,7 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
  /**
   * generic_fillattr - Fill in the basic attributes from the inode struct
   * @inode: Inode to use as the source
-@@ -45,9 +53,20 @@
+@@ -45,9 +53,31 @@
  	stat->ctime = inode->i_ctime;
  	stat->blksize = i_blocksize(inode);
  	stat->blocks = inode->i_blocks;
@@ -1880,12 +1880,23 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
 +extern struct static_key_true ksu_su_compat_enabled;
 +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
 +extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
++/*
++ * 5.4 的 include/linux/namei.h 没有暴露 filename_lookup() —— 它只声明在
++ * fs/internal.h:61 (fs/ 私有头), 而 fs/stat.c 不 include 那个文件。
++ * 这里补一份与 fs/internal.h 逐字一致的声明。
++ * 背景: 5.4 的 vfs_statx() 只拿到用户态字符串, 而 rc3 的 ksu_handle_stat()
++ *       要求 struct filename **(它就地改写 ->name 做 su->sh 重定向),
++ *       所以必须先 getname_flags() 再造出一个 filename 去 lookup。
++ * !! 注意: filename_lookup() 内部会 putname(name), 调用者不得再 putname。
++ */
++extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
++			   struct path *path, struct path *root);
 +#endif // #ifdef CONFIG_KSU_SUSFS
 +
  /**
   * vfs_getattr_nosec - getattr without security checks
   * @path: file to get attributes from
-@@ -78,8 +97,18 @@
+@@ -78,8 +108,18 @@
  		stat->attributes |= STATX_ATTR_AUTOMOUNT;
  
  	if (inode->i_op->getattr)
@@ -1904,7 +1915,7 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
  
  	generic_fillattr(inode, stat);
  	return 0;
-@@ -144,6 +173,10 @@
+@@ -144,6 +184,10 @@
  	if (f.file) {
  		error = vfs_getattr(&f.file->f_path, stat,
  				    request_mask, query_flags);
@@ -1915,7 +1926,7 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
  		fdput(f);
  	}
  	return error;
-@@ -171,6 +204,9 @@
+@@ -171,6 +215,9 @@
  	struct path path;
  	int error = -EINVAL;
  	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
@@ -1925,7 +1936,7 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
  
  	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
  		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
-@@ -184,7 +220,23 @@
+@@ -184,7 +231,23 @@
  		lookup_flags |= LOOKUP_EMPTY;
  
  retry:
