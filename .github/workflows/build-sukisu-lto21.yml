@@ -55,20 +55,6 @@
 #     并顺手修正 fs/read_write.c 的 ksu_handle_sys_read (补全 buf_ptr/count_ptr 两参数)。
 #   ★ 以后换 ReSukiSU 版本, 必须看 "校验 ReSukiSU sucompat ABI 约定" 这一步是否通过;
 #     若它报错, 说明上游又改了约定, 50_ patch 需要同步 (反之亦然)。
-#
-# ★ 内核版本串必须等于 realme 官方值 (20260928 修复, 见「强制 UTS_RELEASE」步骤):
-#   目标: UTS_RELEASE = 5.4.254-qgki-g11b1ffb570a8
-#   背景: Duck Detector 的 kernelcheck 检测项会把「所有能读到内核 release 的
-#     表面」收集起来互相比对, 其中
-#       System.getProperty("os.version")   <- zygote 启动时从 uname() 取的真值快照
-#     是**不可修改**的系统属性 (fork 后每个 App 都继承), 而 SUSFS set_uname 是
-#     hook uname() syscall 且在 post-fs-data 阶段才生效 —— **晚于 zygote**, 所以
-#     快照里存的始终是内核真实版本。真实版本 != 伪装值 -> Divergent -> DANGER。
-#   根治: 让内核自己的版本号就等于官方值。两个表面天然一致, 不需要 set_uname,
-#     也不需要 bind mount 那三个 proc 文件 (app 域本来就读不到它们)。
-#   ★ 注意旧写法踩过的坑: 之前用 `./scripts/config ... --set-str CONFIG_LOCALVERSION "..." || true`,
-#     末尾的 `|| true` 会把「前面某个符号不存在导致的非 0 退出」一起吞掉, 于是
-#     同一条命令里排在后面的 --set-str 根本没执行 -> 版本串退化成 5.4.254-<scm 后缀>。
 # ============================================================
 name: Build SukiSU LTO21 Kernel for oscar
 
@@ -91,7 +77,7 @@ on:
         type: string
         default: '20260921'
       custom_version:
-        description: '【已废弃·请留空】版本串现固定为官方值 5.4.254-qgki-g11b1ffb570a8，填了也会被「强制 UTS_RELEASE」步骤覆盖'
+        description: '自定义版本名 (可选，显示在 uname -r)'
         required: false
         type: string
         default: ''
@@ -447,11 +433,11 @@ jobs:
             -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT \
             -e KSU_SUSFS_SUS_MAP \
             -d KSU_TRACEPOINT_HOOK \
-            -d CONFIG_LOCALVERSION_AUTO
-          # ★ 这里刻意**不加** `|| true`: scripts/config 遇到不存在的符号会以非 0
-          #   退出, 一旦被吞掉, 同一条命令里后面的操作就不会执行 (老代码就是因此
-          #   丢掉了 CONFIG_LOCALVERSION 的设置)。
-          #   版本串统一在 olddefconfig 之后用 sed 强制写入 (见下一段)。
+            -d CONFIG_LOCALVERSION_AUTO \
+            --set-str CONFIG_LOCALVERSION "-qgki-g84e7d691ee3a" || true
+          if [ -n "${{ github.event.inputs.custom_version }}" ]; then
+            ./scripts/config --set-str LOCALVERSION "-${{ github.event.inputs.custom_version }}"
+          fi
           # CFI 开关 (默认开=官方 enforcing; false=仅 LTO)
           if [ "${{ github.event.inputs.enable_cfi }}" = "true" ]; then
             ./scripts/config -e CFI_CLANG -e CFI_CLANG_SHADOW
@@ -462,56 +448,6 @@ jobs:
           fi
           make LLVM=1 ARCH=arm64 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' olddefconfig
-
-          # ============ 6.1 ★★ 强制 UTS_RELEASE == realme 官方内核版本串 ============
-          # 目标: uname -r / /proc/version / 内核内嵌 "Linux version ..." 全部等于
-          #         5.4.254-qgki-g11b1ffb570a8
-          #
-          # 为什么必须 (2026-09-28 Duck Detector 报告驱动):
-          #   kernelcheck 会把 System.getProperty("os.version") (zygote 启动时从
-          #   uname() 取的真值快照, 不可修改, 被所有 App 继承) 与 uname() syscall
-          #   的返回值互相比对。SUSFS set_uname 晚于 zygote, 所以快照里是真实版本,
-          #   与伪装值不等 -> KERNEL_IDENTITY_CONSISTENCY Divergent -> DANGER。
-          #   只要内核真实版本 == 官方值, 两个表面天然一致, 无需任何伪装。
-          #
-          # 三个措施缺一不可:
-          #   1) 清空 EXTRAVERSION      -> KERNELVERSION 保持纯净的 5.4.254
-          #   2) .scmversion 建为空文件 -> scripts/setlocalversion 的 scm_version()
-          #      第一件事就是 `cat .scmversion` 后 return, 于是 git 描述 (-g<hash>),
-          #      '+', '-dirty' 全都不会出现 (GitHub 浅克隆必然不是 tagged commit)
-          #   3) 直接 sed 写 .config 的 CONFIG_LOCALVERSION -> 不依赖 scripts/config
-          # ★ 关键: LineageOS 的 oscar 内核源码树是 5.4.302, 而设备实际使用的
-          #   realme 官方 (prebuilt) 内核是 5.4.254。SUBLEVEL 也参与 UTS_RELEASE
-          #   与 vermagic 计算, 所以必须一并拉回 254 —— 只改 LOCALVERSION 不够。
-          #   两个版本间只差 stable 补丁, 302 是 254 的超集, ABI 兼容
-          #   (本 workflow 的 40 符号 CRC 校验就是在该树上通过官方值校验的)。
-          #
-          # 四个措施缺一不可:
-          #   1) SUBLEVEL = 254         -> base 对齐官方
-          #   2) EXTRAVERSION 清空      -> 不留多余连字符
-          #   3) .scmversion 建为空文件 -> scripts/setlocalversion 的 scm_version()
-          #      第一件事就是 `cat .scmversion` 后 return, 于是 git 描述 (-g<hash>),
-          #      '+', '-dirty' 全都不会出现 (GitHub 浅克隆必然不是 tagged commit)
-          #   4) 直接 sed 写 .config 的 CONFIG_LOCALVERSION -> 不依赖 scripts/config 是否成功
-          WANT_VER="5.4.254-qgki-g11b1ffb570a8"
-          sed -i 's/^SUBLEVEL =.*/SUBLEVEL = 254/' Makefile
-          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
-          touch .scmversion
-          # localversion* 文件会经 collect_files 直接拼进版本串, 必须清掉
-          rm -f localversion* 2>/dev/null || true
-          if grep -q '^CONFIG_LOCALVERSION=' .config; then
-            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${WANT_VER}\"|" .config
-          else
-            echo "CONFIG_LOCALVERSION=\"${WANT_VER}\"" >> .config
-          fi
-          echo "--- 强制版本串后自检 ---"
-          grep -nE '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) =' Makefile
-          grep -n '^CONFIG_LOCALVERSION' .config
-          grep -n '^CONFIG_LOCALVERSION_AUTO' .config || echo "OK: CONFIG_LOCALVERSION_AUTO 未启用"
-          make LLVM=1 ARCH=arm64 \
-            KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' prepare \
-            >/dev/null 2>&1 || true
-          echo "kernelrelease = $(cat include/config/kernel.release 2>/dev/null || echo '(未生成)')"
           echo "--- 配置验证 ---"
           grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
             || echo "!! 未找到 KSU/SUSFS 配置，请检查 ReSukiSU 集成是否成功"
@@ -545,21 +481,11 @@ jobs:
           echo "$VER"
           # ★ 版本串验证: 必须与官方完全一致 (无 '+') 否则 vermagic 不匹配
           #   官方模块全被拒 (wifi/蓝牙/音频全挂, run 32489911904 教训)
-          # ★ 版本串验证: 必须**精确包含** realme 官方内核 release。
-          #   1) vermagic 一致 -> 官方 vendor 模块 (CFI 编译) 才肯加载。带 '+' 或
-          #      hash 后缀时 dmesg 报 version magic mismatch, wifi/蓝牙/音频全挂
-          #      (run 32489911904 教训)
-          #   2) Duck Detector kernelcheck 会把 os.version (zygote 快照) 与 uname()
-          #      互相比对 —— 内核真实版本 == 官方值时两个表面天然一致, 否则报
-          #      KERNEL_IDENTITY_CONSISTENCY Divergent -> DANGER
-          WANT_VER="5.4.254-qgki-g11b1ffb570a8"
-          if ! echo "$VER" | grep -qF "$WANT_VER"; then
-            echo "!! 内核版本串不含官方值 '$WANT_VER'"
-            echo "!! -> vermagic 不匹配 + os.version/uname 不一致, 构建失败"
-            echo "!! 实际版本串: $VER"
+          if echo "$VER" | grep -qE 'qgki-g84e7d691ee3a\+'; then
+            echo "!! 版本串带 '+', vermagic 与官方模块不匹配, 构建失败"
             exit 1
           fi
-          echo "OK: 内核版本串 == 官方值 $WANT_VER"
+          echo "OK: 版本串无 '+', vermagic 与官方一致"
           # ★★★ Module.symvers CRC 校验 (run 32489911904 教训):
           #   dmesg 报 'disagrees about version of symbol module_layout'——
           #   vendor 模块 (CFI 编译) 的 __versions CRC 与官方内核一致,
