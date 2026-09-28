@@ -1004,31 +1004,46 @@ diff -ruN orig/fs/open.c mod/fs/open.c
 +#ifdef CONFIG_KSU_SUSFS
 +extern struct static_key_true ksu_su_compat_enabled;
 +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
-+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
-+			int *flags);
++extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode,
++			int *__unused_flags);
 +#endif
 +
  long do_faccessat(int dfd, const char __user *filename, int mode)
  {
  	const struct cred *old_cred;
-@@ -354,6 +364,18 @@
+@@ -353,6 +363,9 @@
+ 	struct inode *inode;
  	int res;
  	unsigned int lookup_flags = LOOKUP_FOLLOW;
- 
 +#ifdef CONFIG_KSU_SUSFS
++	struct filename *fname = NULL;
++#endif
+ 
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+@@ -395,7 +408,23 @@
+ 
+ 	old_cred = override_creds(override_cred);
+ retry:
++#ifdef CONFIG_KSU_SUSFS
++	fname = getname_flags(filename, lookup_flags, NULL);
++
 +	if (likely(susfs_is_current_proc_umounted()))
 +		goto orig_flow;
 +
 +	if (static_branch_likely(&ksu_su_compat_enabled)) {
 +		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
-+			ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
++			ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
 +	}
 +
 +orig_flow:
++	res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
++	/* no putname(fname) here: filename_lookup() has done it for us */
++#else
+ 	res = user_path_at(dfd, filename, lookup_flags, &path);
 +#endif
-+
- 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
- 		return -EINVAL;
+ 	if (res)
+ 		goto out;
  
 diff -ruN orig/fs/proc/base.c mod/fs/proc/base.c
 --- a/fs/proc/base.c	2026-08-21 13:08:25.423968900 +0800
@@ -1554,20 +1569,21 @@ diff -ruN orig/fs/proc_namespace.c mod/fs/proc_namespace.c
 diff -ruN orig/fs/read_write.c mod/fs/read_write.c
 --- a/fs/read_write.c	2026-08-21 13:08:23.348772000 +0800
 +++ b/fs/read_write.c	2026-08-21 13:08:37.254960400 +0800
-@@ -592,8 +592,18 @@
+@@ -592,8 +592,19 @@
  	return ret;
  }
  
 +#ifdef CONFIG_KSU_SUSFS
 +extern struct static_key_true ksu_is_init_rc_hook_enabled;
-+extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);
++extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,
++			size_t *count_ptr);
 +#endif
 +
  SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
  {
 +#ifdef CONFIG_KSU_SUSFS
 +	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
-+		ksu_handle_sys_read(fd);
++		ksu_handle_sys_read(fd, &buf, &count);
 +#endif
 +
  	return ksys_read(fd, buf, count);
@@ -1863,7 +1879,7 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
 +extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
 +extern struct static_key_true ksu_su_compat_enabled;
 +extern bool __ksu_is_allow_uid_for_current(uid_t uid);
-+extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
++extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
 +#endif // #ifdef CONFIG_KSU_SUSFS
 +
  /**
@@ -1899,25 +1915,40 @@ diff -ruN orig/fs/stat.c mod/fs/stat.c
  		fdput(f);
  	}
  	return error;
-@@ -172,6 +205,18 @@
+@@ -171,6 +204,9 @@
+ 	struct path path;
  	int error = -EINVAL;
  	unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
- 
 +#ifdef CONFIG_KSU_SUSFS
++	struct filename *fname = NULL;
++#endif
+ 
+ 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
+ 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
+@@ -184,7 +220,23 @@
+ 		lookup_flags |= LOOKUP_EMPTY;
+ 
+ retry:
++#ifdef CONFIG_KSU_SUSFS
++	fname = getname_flags(filename, lookup_flags, NULL);
++
 +	if (likely(susfs_is_current_proc_umounted()))
 +		goto orig_flow;
 +
 +	if (static_branch_likely(&ksu_su_compat_enabled)) {
 +		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
-+			ksu_handle_stat(&dfd, &filename, &flags);
++			ksu_handle_stat(&dfd, &fname, &flags);
 +	}
 +
 +orig_flow:
++	error = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
++	/* no putname(fname) here: filename_lookup() has done it for us */
++#else
+ 	error = user_path_at(dfd, filename, lookup_flags, &path);
 +#endif
-+
- 	if ((flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |
- 		       AT_EMPTY_PATH | KSTAT_QUERY_FLAGS)) != 0)
- 		return -EINVAL;
+ 	if (error)
+ 		goto out;
+ 
 diff -ruN orig/fs/statfs.c mod/fs/statfs.c
 --- a/fs/statfs.c	2026-08-21 13:08:23.941218000 +0800
 +++ b/fs/statfs.c	2026-08-21 13:08:37.356418400 +0800

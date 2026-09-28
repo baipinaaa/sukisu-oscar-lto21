@@ -37,6 +37,24 @@
 #   - LTO 编译时间: ThinLTO 链接全内核较慢, 首次构建预计 60-120 分钟
 #   - CFI enforcing (官方 # CONFIG_CFI_PERMISSIVE is not set):
 #     KSU syscall table hook 需 .cfi_jt 跳板地址 (ReSukiSU 已内置支持)
+#
+# ★ ReSukiSU ABI 约定 (20260928 修复, 务必先读):
+#   20260921 首次用 rc3 构建出的 boot.img 刷入后进 recovery
+#   ("Cannot load Android system. Your data may be corrupt")。
+#   根因: rc3 的 commit 03b60f2 "kernel: sync with latest susfs" 把
+#     ksu_handle_faccessat / ksu_handle_stat 的**调用约定**从
+#       (const char __user **filename_user)
+#     改成
+#       (struct filename **filename)          <- 多解一层,
+#     同时删掉了 rc1 里的版本护栏
+#       #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0) && defined(CONFIG_KSU_SUSFS)
+#     -> 5.4 内核被强制要求新约定; 而我们的 50_ patch 仍传字符串指针,
+#        内核把 const char __user ** 当 struct filename ** 解引用 -> oops。
+#   修复: patches/50_ 中 fs/open.c / fs/stat.c 的 hook 改为
+#     getname_flags() + filename_lookup() 并传 &fname (与官方最新 susfs patch 一致),
+#     并顺手修正 fs/read_write.c 的 ksu_handle_sys_read (补全 buf_ptr/count_ptr 两参数)。
+#   ★ 以后换 ReSukiSU 版本, 必须看 "校验 ReSukiSU sucompat ABI 约定" 这一步是否通过;
+#     若它报错, 说明上游又改了约定, 50_ patch 需要同步 (反之亦然)。
 # ============================================================
 name: Build SukiSU LTO21 Kernel for oscar
 
@@ -69,10 +87,10 @@ on:
         type: boolean
         default: true
       resukisu_ref:
-        description: 'ReSukiSU 版本钉扎 (commit SHA / tag)。默认 b2ac2fc8 = 20260817 已验证可启动的 v4.2.0-rc1；填 latest 用最新版（v4.2.0-rc3 实测无法启动）'
+        description: 'ReSukiSU 版本钉扎 (commit SHA / tag)。默认 fa8311f6 = v4.2.0-rc3，其 sucompat ABI 已由 patches/50_ 适配；填 latest 用最新版（ABI 可能又变，构建时会校验）'
         required: false
         type: string
-        default: 'b2ac2fc8703ce9f5226e2a38a59f8b72f8a3005c'
+        default: 'fa8311f632a215b5381ec644627c6198d1e8a13e'
 
 env:
   DEVICE: 'oscar'
@@ -183,9 +201,12 @@ jobs:
           rm -rf KernelSU
           git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
           cd KernelSU
-          # ★ 版本钉扎: 20260921 构建因 clone 到最新版 (fa8311f6, v4.2.0-rc3) 而无法启动;
-          #   b2ac2fc8 (v4.2.0-rc1) 是 20260817 已验证能启动的版本。
+          # ★ 版本钉扎: 默认 fa8311f6 = v4.2.0-rc3。
+          #   rc3 在 20260921 无法启动的根因已在 patches/50_ 中修好 (见文件头注释):
+          #   rc3 commit 03b60f2 把 ksu_handle_faccessat / ksu_handle_stat 的调用约定
+          #   由 (const char __user **) 改成 (struct filename **) 并删掉了 >=6.1.0 护栏。
           #   保留全量历史以便 checkout 任意 commit; resukisu_ref=latest 则用默认分支最新提交。
+          #   ★ 换版本后 ABI 校验步骤 (下一步) 会挡住不匹配的组合。
           REF="${{ github.event.inputs.resukisu_ref }}"
           if [ -n "$REF" ] && [ "$REF" != "latest" ]; then
             git checkout "$REF"
@@ -201,6 +222,47 @@ jobs:
           echo "--- 检查 ReSukiSU 源码是否集成 ---"
           ls -la drivers/kernelsu/ | head -8
           grep -n "kernelsu" drivers/Makefile
+
+      # ============ 4.2 校验 ReSukiSU sucompat ABI 约定与 50_ patch 一致 ============
+      # ★ 这一步是最重要的保险丝。rc3 曾把 ksu_handle_faccessat / ksu_handle_stat
+      #   的调用约定从 (const char __user **) 静默改成 (struct filename **),
+      #   编译器检查不出来 (声明与调用点都在我们自己的 50_ patch 里, 自洽),
+      #   结果是内核每次 faccessat/stat 都 oops -> 刷入后直接进 recovery。
+      #   这里在编译前把约定钉死, 让不匹配的版本组合**构建失败**而不是刷出一个坏 boot。
+      - name: 校验 ReSukiSU sucompat ABI 约定
+        run: |
+          cd kernel/KernelSU
+          fail=0
+          chk() { # $1=文件  $2=ERE  $3=说明
+            if grep -qE "$2" "$1"; then
+              echo "OK   $3  [$1]"
+            else
+              echo "!!   $3  [$1] 未找到: $2"
+              fail=1
+            fi
+          }
+          # SUSFS 分支的声明必须出现在最前面 (= CONFIG_KSU_SUSFS 选中的那一个)
+          HEAD_DECL=$(grep -n 'int ksu_handle_faccessat(int \*dfd,' kernel/feature/sucompat.h | head -1)
+          echo "sucompat.h 首个 ksu_handle_faccessat 声明:"
+          echo "  $HEAD_DECL"
+          if echo "$HEAD_DECL" | grep -q 'struct filename \*\*filename'; then
+            echo "OK   sucompat.h 首个声明是 struct filename ** (rc3 约定)"
+          else
+            echo "!!   sucompat.h 首个声明不是 struct filename ** -> 与 50_ patch 不匹配"
+            fail=1
+          fi
+          chk kernel/feature/sucompat.h  'int ksu_handle_stat\(int \*dfd, struct filename \*\*filename, int \*flags\);'                            'sucompat.h  ksu_handle_stat 新约定'
+          chk kernel/feature/sucompat.c  'int ksu_handle_faccessat\(int \*dfd, struct filename \*\*filename, int \*mode, int \*__unused_flags\)'     'sucompat.c  ksu_handle_faccessat 实现'
+          chk kernel/feature/sucompat.c  'int ksu_handle_stat\(int \*dfd, struct filename \*\*filename, int \*flags\)'                                   'sucompat.c  ksu_handle_stat 实现'
+          chk kernel/feature/sucompat.c  'int ksu_handle_execveat_sucompat\(int \*fd, struct filename \*\*filename_ptr'                                    'sucompat.c  ksu_handle_execveat_sucompat'
+          chk kernel/runtime/ksud_integration.c 'int ksu_handle_sys_read\(unsigned int fd, char __user \*\*buf_ptr, size_t \*count_ptr\)'               'ksud_integration.c ksu_handle_sys_read 三参数'
+          chk kernel/runtime/ksud_integration.c 'int ksu_handle_input_handle_event\(unsigned int \*type, unsigned int \*code, int \*value\)'            'ksud_integration.c ksu_handle_input_handle_event'
+          if [ "$fail" != 0 ]; then
+            echo "!! ReSukiSU 与 patches/50_add_susfs_in_kernel-5.4.patch 的 ABI 约定不匹配, 终止构建"
+            echo "!! 请对照 fs/open.c / fs/stat.c / fs/read_write.c 的 hook 决定改哪边"
+            exit 1
+          fi
+          echo "sucompat ABI 校验通过 (ReSukiSU 侧)"
 
       # ============ 4.4 应用 selinux_hide access 探测过滤 patch (ReSukiSU) ============
       # 在 my_write_access() 里过滤含 fsck_untrusted / su / adbroot 的 access 查询,
@@ -226,6 +288,16 @@ jobs:
           ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
           grep -n "susfs" fs/Makefile
           grep -c "CONFIG_KSU_SUSFS" fs/namei.c
+          # ★ ABI: 调用点必须传 struct filename ** (与 ReSukiSU rc3 的 CONFIG_KSU_SUSFS 分支一致),
+          #   否则内核会把 const char __user ** 当 struct filename ** 解引用 -> oops 进 recovery
+          echo "--- 验证 sucompat 调用点 ABI (新约定) ---"
+          grep -n "ksu_handle_faccessat(int \*dfd, struct filename \*\*filename" fs/open.c
+          grep -n "ksu_handle_faccessat(&dfd, &fname, &mode, NULL)" fs/open.c
+          grep -n "filename_lookup(dfd, fname, lookup_flags, &path, NULL)" fs/open.c
+          grep -n "ksu_handle_stat(int \*dfd, struct filename \*\*filename" fs/stat.c
+          grep -n "ksu_handle_stat(&dfd, &fname, &flags)" fs/stat.c
+          grep -n "ksu_handle_sys_read(fd, &buf, &count)" fs/read_write.c
+          echo "sucompat ABI 校验通过 (内核侧)"
 
       # ============ 4.6 可选: CFI 关闭时提供假 __cfi_slowpath ============
       # 仅当 enable_cfi=false (关闭 CFI) 时应用: 官方 vendor 模块是 CFI 编译的,
