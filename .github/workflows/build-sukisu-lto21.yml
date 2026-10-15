@@ -26,7 +26,13 @@
 #      (patches/ 下 3 个 patch 必须一起推: 50_add_susfs_in_kernel-5.4.patch,
 #       55_add_selinux_hide_access_filter.patch, 60_add_rekernel.patch)
 #   2. Actions 页面 → Build SukiSU LTO21 Kernel for oscar → Run workflow
-#      (los_date 填你手机当前系统 nightly 的日期，必须一致！)
+#      ★ los_date 不再是必填的"当前 nightly": 现在会先用官方 API
+#        (download.lineageos.org/api/v2/devices/<device>/builds) 解析出
+#        lineage-<los_version> 最新**仍可下载**的 build, 取其 boot.img 直链+sha256。
+#        los_date 降级为"API 不可用时的兜底日期"。
+#        (2026-10-15: mirrorbits 只保留最近几个 nightly 的 /full/ 目录, 写死
+#         20260921 的直链 404 导致 build 104858632193 失败)
+#      ★ los_version 决定挑哪个版本的 nightly (23.2 → 23.2 的 build, 不会串到 24)
 #      ★ 内核 commit 已随 los_date 同步: 20260921/0914/0907 均对应
 #        84e7d691ee3a094de68628c488847a4dd632e7eb (官方 build-manifest 实测)
 #        换别的 nightly 日期前, 先用 build-manifest.xml 核对内核 revision!
@@ -70,15 +76,15 @@ on:
         type: string
         default: 'lineage-23.2'
       los_version:
-        description: 'LineageOS 版本 (用于 nightly 下载链接)'
+        description: 'LineageOS 版本 (决定从官方 API 里挑哪个版本的 nightly, 如 23.2 / 24.0)'
         required: true
         type: string
         default: '23.2'
       los_date:
-        description: 'LineageOS nightly 日期 YYYYMMDD (必须与你手机当前系统一致!)'
-        required: true
+        description: '兜底 nightly 日期 YYYYMMDD (正常由官方 API 自动解析最新可用 build; 仅 API 不可用时用此日期拼直链)'
+        required: false
         type: string
-        default: '20260921'
+        default: '20261005'
       custom_version:
         description: '自定义版本名 (可选，显示在 uname -r)'
         required: false
@@ -702,52 +708,67 @@ jobs:
           echo "===== 诊断完成 ====="
 
       # ============ 6. 原版 boot.img (缓存) ============
+      # 先用官方 API 解析 lineage-<los_version> 最新仍可下载的 nightly, 拿到
+      # boot.img 直链 / sha256 / OTA zip 直链。写死日期的直链会被 mirrorbits 清理
+      # (2026-10-15: 20260921 直链 404 → build 104858632193 失败)。
+      - name: 解析 lineage-${{ github.event.inputs.los_version }} 最新可用 nightly (官方 API)
+        id: losresolve
+        run: |
+          set -e
+          python3 _tools/resolve_los_build.py \
+            --device "${DEVICE}" \
+            --version "${{ github.event.inputs.los_version }}" \
+            --fallback-date "${{ github.event.inputs.los_date }}" \
+            > los_build.env
+          echo "----- resolve_los_build 结果 -----"
+          cat los_build.env
+          while IFS='=' read -r k v; do
+            [ -n "$k" ] && echo "${k}=${v}" >> "$GITHUB_OUTPUT"
+          done < los_build.env
+
       - name: 恢复原版 boot.img 缓存
         id: cache-boot
         uses: actions/cache/restore@v6
         with:
           path: boot.img
-          key: boot-oscar-${{ github.event.inputs.los_date }}
+          key: boot-oscar-${{ steps.losresolve.outputs.LOS_VERSION }}-${{ steps.losresolve.outputs.LOS_DATE }}
 
       - name: 从 LineageOS nightly 获取原版 boot.img (直链或 payload 提取)
         if: steps.cache-boot.outputs.cache-hit != 'true'
         run: |
           set -e
-          EXPECT_SHA=""
-          if curl -s --max-time 20 "https://download.lineageos.org/api/v2/devices/${DEVICE}/builds" -o los_builds.json; then
-          EXPECT_SHA=$(python3 -c "
-          import json
-          d = json.load(open('los_builds.json'))
-          date = '${{ github.event.inputs.los_date }}'
-          for b in d:
-              if b.get('date','').replace('-','') == date:
-                  for f in b.get('files',[]):
-                      if f.get('filename') == 'boot.img':
-                          print(f.get('sha256',''))
-          ")
-            rm -f los_builds.json
-            echo "官方 API 返回 boot.img sha256: $EXPECT_SHA"
+          SOURCE="${{ steps.losresolve.outputs.SOURCE }}"
+          LOS_DATE="${{ steps.losresolve.outputs.LOS_DATE }}"
+          LOS_VER="${{ steps.losresolve.outputs.LOS_VERSION }}"
+          EXPECT_SHA="${{ steps.losresolve.outputs.BOOT_SHA256 }}"
+          echo "解析来源=$SOURCE  los_version=$LOS_VER  los_date=$LOS_DATE"
+          echo "boot.img 直链: ${{ steps.losresolve.outputs.BOOT_URL }}"
+          if [ -n "$EXPECT_SHA" ]; then
+            echo "期望 sha256(来自官方 API): $EXPECT_SHA"
           else
-            echo "官方 API 不可用, 跳过 sha256 校验"
+            echo "无 sha256 (API fallback), 跳过内容校验"
           fi
           for BOOT_URL in \
-            "https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img" \
-            "https://mirror.freedif.org/lineageos/full/${DEVICE}/${{ github.event.inputs.los_date }}/boot.img"; do
+            "${{ steps.losresolve.outputs.BOOT_URL }}" \
+            "${{ steps.losresolve.outputs.BOOT_URL_MIRROR }}"; do
+            [ -z "$BOOT_URL" ] && continue
             echo "尝试直链: $BOOT_URL"
-            HTTP=$(curl -sL -o boot.img -w '%{http_code}' --retry 3 "$BOOT_URL" || echo 000)
+            HTTP=$(curl -sL -o boot.img -w '%{http_code}' --retry 3 --max-time 600 "$BOOT_URL" || echo 000)
             if [ "$HTTP" = "200" ] && [ -s boot.img ]; then
               echo "直链下载成功: $(stat -c%s boot.img) bytes"
               break
             fi
+            echo "!! 直链失败 (HTTP $HTTP)"
             rm -f boot.img
           done
           if [ -s boot.img ]; then
             echo "boot.img 就绪 (直链)"
           else
             echo "直链均不可用, 改用 payload.bin 提取"
-            LOS_URL="https://mirrorbits.lineageos.org/full/${DEVICE}/${{ github.event.inputs.los_date }}/lineage-${{ github.event.inputs.los_version }}-${{ github.event.inputs.los_date }}-nightly-${DEVICE}-signed.zip"
+            LOS_URL="${{ steps.losresolve.outputs.ZIP_URL }}"
+            [ -z "$LOS_URL" ] && { echo "::error::ZIP_URL 为空, 无法回退到 payload 提取"; exit 1; }
             echo "下载: $LOS_URL"
-            curl -sL --retry 3 -o los.zip "$LOS_URL"
+            curl -sL --retry 3 --max-time 1800 -o los.zip "$LOS_URL"
             unzip -o los.zip payload.bin
             rm -f los.zip
             if [ ! -x ./payload-dumper-go ]; then
@@ -777,14 +798,15 @@ jobs:
             echo "sha256 校验通过"
           fi
           test -s boot.img
-          echo "boot.img 就绪"
+          echo "boot.img 就绪 (los_date=$LOS_DATE)"
+          echo "BOOT_IMG_RESOLVED_DATE=$LOS_DATE" >> $GITHUB_ENV
 
       - name: 保存原版 boot.img 缓存
         if: steps.cache-boot.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: boot.img
-          key: boot-oscar-${{ github.event.inputs.los_date }}
+          key: boot-oscar-${{ steps.losresolve.outputs.LOS_VERSION }}-${{ steps.losresolve.outputs.LOS_DATE }}
 
       # ============ 7. 打包 + 上传 ============
       - name: 解包原 boot + 打包 new_boot.img
@@ -839,7 +861,7 @@ jobs:
         if: always()   # ★ 构建失败也要上传 diag/ (诊断 .symtypes) 供分析
         uses: actions/upload-artifact@v4
         with:
-          name: oscar-sukisu-lto21-${{ github.event.inputs.los_date }}-new_boot
+          name: oscar-sukisu-lto21-${{ steps.losresolve.outputs.LOS_DATE }}-new_boot
           path: |
             new_boot.img
             SHA256SUMS.txt

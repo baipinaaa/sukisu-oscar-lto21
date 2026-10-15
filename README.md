@@ -46,14 +46,47 @@ Linux version 5.4.302-qgki-g84e7d691ee3a (root@3c794f190b77)
 | workaround patch | 60_/70_/80_ 三个 | **零个** (60_ 编号已复用给 Re:Kernel) |
 | 编译时间 | 40-90 分钟 | 60-120 分钟 (LTO 链接慢) |
 
-## 编译流程 (GitHub Actions, 28 步)
+## 编译流程 (GitHub Actions, 29 步)
 ```
 检出仓库 → 内核源码(缓存) → 依赖 → clang21(缓存) → 集成 ReSukiSU
 → 55_ selinux_hide / SUSFS 5.4 patch / 60_ Re:Kernel patch
 → trace include / tcpc / oplus_project 源码兼容
 → 配置 (LLVM=1 + holi-qgki_defconfig + KSU/SUSFS/REKERNEL 开关)
-→ 编译 (LLVM=1 + ccache) → 获取原版 boot.img → 打包 → 上传
+→ 编译 (LLVM=1 + ccache) → 解析官方 API 最新可用 nightly
+→ 获取原版 boot.img → 打包 → 上传
 ```
+
+### boot.img 来源：不再写死日期 (2026-10-15 修正)
+
+mirrorbits **只保留最近几个 nightly 的 `/full/<device>/<date>/` 目录**，写死日期的
+直链会被清理。`build 104858632193` 就是因为 `20260921` 已被清掉而 404 失败。
+
+现在 workflow 步骤 6 先用 `_tools/resolve_los_build.py` 查官方 API：
+
+```
+GET https://download.lineageos.org/api/v2/devices/oscar/builds
+```
+
+从中筛出 `version == <los_version 输入>` 的 build，按日期倒序取**最新**一个，
+直接拿到该 build 的 `boot.img` 文件名 / `sha256` / `size` 与 OTA `zip` 直链：
+
+| 输入 | 作用 | 默认 |
+|---|---|---|
+| `los_version` | 挑哪个版本的 nightly（`23.2` 不会串到 `24.0`） | `23.2` |
+| `los_date` | **兜底日期**：仅官方 API 不可用时用它拼直链 | `20261005` |
+
+解析结果（`SOURCE` / `LOS_VERSION` / `LOS_DATE` / `BOOT_URL` /
+`BOOT_URL_MIRROR` / `BOOT_SHA256` / `BOOT_SIZE` / `ZIP_URL` / `ZIP_SHA256`）
+通过 `$GITHUB_OUTPUT` 传给后续步骤，其中：
+
+- boot.img 缓存 key = `boot-oscar-<LOS_VERSION>-<LOS_DATE>`，artifact 名同用 `<LOS_DATE>`；
+- 直链先试 `mirrorbits` 再试 `mirror.freedif.org`，两者都失败才下载 OTA zip
+  并用 payload-dumper 从 `payload.bin` 提取 boot；
+- 下载完成后用官方 API 的 `sha256` / `size` 做内容校验（API fallback 时无 sha，跳过）。
+
+> 23.2 与 24.x 的内核源码同为 `lineage-23.2`/`84e7d691ee3a`，本项目**不需要**升到 24。
+> `20261005` 的 `boot.img` sha256 =
+> `97e1b8e2d6714e7adf5c850ecb60552066b90513da2ef4485bb9be949fae2d0c`，size `167772160`。
 
 **关键编译命令**：
 
@@ -184,6 +217,7 @@ version of symbol module_layout`)。workflow 因此在编译步骤尾部加了
 |---|---|---|---|
 | 20260817（手机当前） | `c8c87694a044` | 2026-01-27 | `0x392bc26a` |
 | 20260921 / 0914 / 0907 | `84e7d691ee3a` | 2026-08-22 | `0x32aa09e1` |
+| 20261005（官方 23.2 最新） | `84e7d691ee3a` | 2026-08-22 | `0x32aa09e1` |
 
 > `84e7d691ee3a` = `lineage-23.2` 分支 HEAD，commit message
 > "arm64: configs: Regenerate Q/GKI holi defconfigs"。
@@ -345,7 +379,7 @@ HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消
 
 ```
 sukisu-oscar-lto21/
-├── .github/workflows/build-sukisu-lto21.yml   # 28 步 workflow
+├── .github/workflows/build-sukisu-lto21.yml   # 29 步 workflow
 ├── patches/
 │   ├── 50_add_susfs_in_kernel-5.4.patch       # SUSFS 5.4 移植 (含 sucompat ABI rc3 适配)
 │   ├── 55_add_selinux_hide_access_filter.patch # ReSukiSU selinux_hide access 探测过滤
