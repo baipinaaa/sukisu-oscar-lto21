@@ -323,10 +323,21 @@ jobs:
       # 因此 patch 顺序无约束; 放在 50_ 之后仅为便于阅读。
       # binder.c / signal.c 用 #include <../rekernel/rekernel.h> 这类内核根相对
       # 路径, 依赖 KCFLAGS='-I.' (配置与编译步骤均已带)。
+      # ★ drivers/Kconfig 与 drivers/Makefile 的挂载 hunk **不在 patch 里**:
+      #   步骤 10 集成 ReSukiSU 时已改过这两个文件 (Kconfig 末尾 endmenu 前插
+      #   drivers/kernelsu/Kconfig; Makefile 末尾追加 obj-$(CONFIG_KSU)), patch
+      #   的 context 必然错位 (CI 首跑即 drivers/Kconfig Hunk #1 FAILED at 230、
+      #   drivers/Makefile Hunk #1 FAILED at 186)。因此改由下面的幂等 sed/printf
+      #   挂载 (与步骤 10 同手法), 重复运行安全。
       - name: 应用 Re:Kernel patch
         run: |
           cd kernel
           patch -p1 < ../patches/60_add_rekernel.patch
+          echo "--- 挂载 Re:Kernel 到 drivers/ 层级 (patch 之外, 幂等) ---"
+          grep -q 'drivers/rekernel/Kconfig' drivers/Kconfig \
+            || sed -i '/^endmenu/i\source "drivers/rekernel/Kconfig"' drivers/Kconfig
+          grep -q 'CONFIG_REKERNEL' drivers/Makefile \
+            || printf '\nobj-$(CONFIG_REKERNEL) += rekernel/\n' >> drivers/Makefile
           echo "--- 验证 Re:Kernel 已集成 ---"
           ls -la drivers/rekernel/
           grep -n "rekernel" drivers/Kconfig drivers/Makefile

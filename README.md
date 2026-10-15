@@ -314,7 +314,7 @@ HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消
 | `drivers/android/binder.c` | 事务 / 回复 / oneway 溢出埋点 (`rekernel_binder_transaction`、`binder_trans_handler`、`binder_reply_handler`、`binder_overflow_handler`) |
 | `kernel/signal.c` | `do_send_sig_info()` 中 SIGKILL/SIGTERM/SIGABRT/SIGQUIT 上报 `rekernel_report(SIGNAL, ...)` |
 | `drivers/rekernel/{Kconfig,Makefile,rekernel.c,rekernel.h}` | 新驱动，`CONFIG_REKERNEL` (default y)，`CONFIG_REKERNEL_NETWORK` (default n) |
-| `drivers/Kconfig` / `drivers/Makefile` | `source "drivers/rekernel/Kconfig"` / `obj-$(CONFIG_REKERNEL) += rekernel/` |
+| `drivers/Kconfig` / `drivers/Makefile` | **不在 patch 里**，由 workflow 步骤 4.55 用幂等 `sed`/`printf` 挂载（见下） |
 
 **集成要点**：
 - 与 55_/50_ **无文件重叠**（50_ 只动 `fs/`、`drivers/input/input.c`、`kernel/{kallsyms,reboot,sys}.c`、`mm/`、`security/selinux/avc.c`）→ patch 顺序无约束。
@@ -323,6 +323,13 @@ HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消
   依赖 `KCFLAGS='-I.'`（配置与编译步骤均已带，与高通相对 include 共用）。
 - 纯 C 埋点 + 新字符设备驱动，不涉及间接调用跳转 → 与 **CFI enforcing 无冲突**；
   不改变 struct 布局 → 不影响 module_layout CRC。
+- **挂载为何不走 patch**（CI 首跑教训）：步骤 10 集成 ReSukiSU 时已改过
+  `drivers/Kconfig`（在末尾 `endmenu` 前插 `source "drivers/kernelsu/Kconfig"`）和
+  `drivers/Makefile`（末尾追加 `obj-$(CONFIG_KSU) += kernelsu/`），patch 里这两个
+  文件的 context 必然错位 → `Hunk #1 FAILED at 230` / `FAILED at 186`，随后
+  `patch --dry-run` 报「未应用干净」直接 fail。改为 patch 只管 6 个纯净文件
+  （`drivers/rekernel/*` 4 个 + `binder.c` + `signal.c`），两个挂载用
+  `grep -q ... || sed/printf` 幂等完成（与步骤 10 同手法，可重复运行）。
 - workflow 步骤 4.55 应用后会校验 `rekernel_binder_transaction`、
   `rekernel_report(SIGNAL`、`source "drivers/rekernel/Kconfig"`、
   `obj-$(CONFIG_REKERNEL)` 四个标记，缺一即构建失败。
@@ -342,7 +349,7 @@ sukisu-oscar-lto21/
 ├── patches/
 │   ├── 50_add_susfs_in_kernel-5.4.patch       # SUSFS 5.4 移植 (含 sucompat ABI rc3 适配)
 │   ├── 55_add_selinux_hide_access_filter.patch # ReSukiSU selinux_hide access 探测过滤
-│   ├── 60_add_rekernel.patch                  # Re:Kernel (binder/signal 卡顿治理)
+│   ├── 60_add_rekernel.patch                  # Re:Kernel (binder/signal; drivers/ 挂载见 workflow 4.55)
 │   └── 70_add_cfi_slowpath.patch              # 仅 enable_cfi=false 时应用 (CFI 关闭兜底)
 ├── _tools/check_hunk_headers.py               # patch hunk 头校验小工具
 └── README.md
