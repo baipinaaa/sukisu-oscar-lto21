@@ -9,9 +9,11 @@
 #   - 官方 defconfig 自带的 CONFIG_LTO_CLANG=y + CONFIG_CFI_CLANG=y
 #     不再被降级 (之前用 GNU ld 导致 LD_IS_LLD=n -> Kconfig 自动降级
 #     LTO_NONE, 这就是 WiFi/蓝牙/音频全挂的根源)
-#   - 因此不需要 60_/70_/80_ 三个 workaround patch:
+#   - 因此不需要旧方案 (sukisu-oscar) 的 60_/70_/80_ 三个 workaround patch:
 #       * 60_ 跳 CRC  -> 不需要 (LTO 下 struct module 布局与官方一致,
 #                         module_layout CRC 自动匹配)
+#       ★ 注意: 本仓库 patches/60_ 这个编号已**复用给 Re:Kernel** (与旧方案的
+#         60_ 跳 CRC 无关); 70_ 仍是 CFI 关闭时的兜底 patch。
 #       * 70_ 假 cfi_slowpath -> 不需要 (CFI_CLANG=y 内核自带真实现)
 #       * 80_ 关 PREL32 -> 不需要 (LTO_CLANG=y 时 PREL32 自动 n)
 #   - ReSukiSU 原生支持 CFI (.cfi_jt 符号解析, symbol_resolver.c),
@@ -21,7 +23,8 @@
 #
 # 用法:
 #   1. 在 GitHub 新建仓库，把本文件放到 .github/workflows/ 下并 push
-#      (patches/50_add_susfs_in_kernel-5.4.patch 必须一起推)
+#      (patches/ 下 3 个 patch 必须一起推: 50_add_susfs_in_kernel-5.4.patch,
+#       55_add_selinux_hide_access_filter.patch, 60_add_rekernel.patch)
 #   2. Actions 页面 → Build SukiSU LTO21 Kernel for oscar → Run workflow
 #      (los_date 填你手机当前系统 nightly 的日期，必须一致！)
 #      ★ 内核 commit 已随 los_date 同步: 20260921/0914/0907 均对应
@@ -309,6 +312,36 @@ jobs:
           grep -n '^#include "internal.h"' fs/open.c
           echo "sucompat ABI 校验通过 (内核侧)"
 
+      # ============ 4.55 应用 Re:Kernel patch (binder/signal 卡顿治理) ============
+      # JackA1ltman/Re-Kernel: 无 root 环境下缓解「墓碑(tombstone)用户」的后台
+      # 冻结/杀进程体验。改动点:
+      #   - drivers/android/binder.c : 事务/回复/溢出埋点 (rekernel_binder_transaction
+      #     等), 5.4 需 binder_transaction data 参数形态适配
+      #   - kernel/signal.c           : 发送 SIGKILL/TERM/ABRT/QUIT 时上报
+      #   - drivers/rekernel/         : 新驱动 (Kconfig REKERNEL, default y)
+      # 与 55_/50_ 无文件重叠 (50_ 只动 fs/ + input/ + selinux + kallsyms 等),
+      # 因此 patch 顺序无约束; 放在 50_ 之后仅为便于阅读。
+      # binder.c / signal.c 用 #include <../rekernel/rekernel.h> 这类内核根相对
+      # 路径, 依赖 KCFLAGS='-I.' (配置与编译步骤均已带)。
+      - name: 应用 Re:Kernel patch
+        run: |
+          cd kernel
+          patch -p1 < ../patches/60_add_rekernel.patch
+          echo "--- 验证 Re:Kernel 已集成 ---"
+          ls -la drivers/rekernel/
+          grep -n "rekernel" drivers/Kconfig drivers/Makefile
+          grep -c "rekernel_" drivers/android/binder.c kernel/signal.c
+          # 幂等性/形态校验: 每个 hook 点都必须真的在
+          for pat in "rekernel_binder_transaction" "rekernel_report(SIGNAL" \
+                     "source \"drivers/rekernel/Kconfig\"" "obj-\$(CONFIG_REKERNEL)"; do
+            if grep -rq "$pat" drivers/Kconfig drivers/Makefile drivers/android/binder.c kernel/signal.c; then
+              echo "OK: $pat"
+            else
+              echo "!! 未找到 $pat, Re:Kernel patch 可能未生效"
+              exit 1
+            fi
+          done
+
       # ============ 4.6 可选: CFI 关闭时提供假 __cfi_slowpath ============
       # 仅当 enable_cfi=false (关闭 CFI) 时应用: 官方 vendor 模块是 CFI 编译的,
       # 引用 __cfi_slowpath; 关闭 CFI 后内核无此符号 -> 模块被拒。提供假实现
@@ -424,6 +457,8 @@ jobs:
           make LLVM=1 ARCH=arm64 KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
           # ★ LineageOS 官方 oscar 构建 = holi-qgki_defconfig + debugfs.config 合并
           ./scripts/config -d DEBUG_FS -d PAGE_OWNER
+          # 开启 Re:Kernel (binder/signal 卡顿优化; Kconfig default y, 显式写防上游改默认)
+          ./scripts/config -e REKERNEL
           # 开启 ReSukiSU + SUSFS 全部 9 个子开关
           ./scripts/config -e KSU -e KALLSYMS -e KALLSYMS_ALL \
             -e KSU_SUSFS \
@@ -449,7 +484,7 @@ jobs:
           make LLVM=1 ARCH=arm64 \
             KCFLAGS='-I. -Idrivers/usb/typec/tcpc -DKSU_COMPAT_HAS_SELINUX_STATE' olddefconfig
           echo "--- 配置验证 ---"
-          grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
+          grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KSU_SUSFS|CONFIG_REKERNEL|CONFIG_LOCALVERSION|CONFIG_DEBUG_FS|CONFIG_PAGE_OWNER|CONFIG_MODVERSIONS" .config \
             || echo "!! 未找到 KSU/SUSFS 配置，请检查 ReSukiSU 集成是否成功"
           echo "--- LTO/CFI 验证 (本方案核心!) ---"
           grep -E "CONFIG_LTO|CONFIG_CFI|CONFIG_THINLTO|CONFIG_LD_IS_LLD|CONFIG_CC_IS_CLANG" .config

@@ -26,7 +26,10 @@ Linux version 5.4.302-qgki-g84e7d691ee3a (root@3c794f190b77)
 `LD_IS_LLD=n` → Kconfig 依赖不满足 → `LTO_CLANG=y` 被**自动降级为 LTO_NONE**，
 这就是 module_layout CRC 不匹配 / 缺 `__cfi_slowpath` / PREL32 布局错位的
 **共同根源**。本方案用 `make LLVM=1` 让 LTO/CFI 生效，与官方 ABI 完全对齐，
-**不需要 60_/70_/80_ 三个 workaround patch**。
+**不需要旧方案 (sukisu-oscar) 的 60_/70_/80_ 三个 workaround patch**。
+
+> ★ 编号提醒：本仓库 `patches/60_add_rekernel.patch` 是 **Re:Kernel**，与旧方案
+> 的「60_ 跳 CRC」workaround **无关**（后者在本方案不需要）。
 
 ## 与 sukisu-oscar 的差异
 
@@ -40,14 +43,15 @@ Linux version 5.4.302-qgki-g84e7d691ee3a (root@3c794f190b77)
 | PREL32 | 用 80_ patch 关闭 | LTO 自动关闭 |
 | CRC 校验 | 60_ patch 跳过 | 自动匹配 (结构布局与官方一致) |
 | __cfi_slowpath | 70_ patch 假实现 | 内核自带真实现 |
-| workaround patch | 60_/70_/80_ 三个 | **零个** |
+| workaround patch | 60_/70_/80_ 三个 | **零个** (60_ 编号已复用给 Re:Kernel) |
 | 编译时间 | 40-90 分钟 | 60-120 分钟 (LTO 链接慢) |
 
-## 编译流程 (GitHub Actions, 23 步)
+## 编译流程 (GitHub Actions, 28 步)
 ```
 检出仓库 → 内核源码(缓存) → 依赖 → clang21(缓存) → 集成 ReSukiSU
-→ SUSFS 5.4 patch → trace include / tcpc / oplus_project 源码兼容
-→ 配置 (LLVM=1 + holi-qgki_defconfig + KSU/SUSFS 开关)
+→ 55_ selinux_hide / SUSFS 5.4 patch / 60_ Re:Kernel patch
+→ trace include / tcpc / oplus_project 源码兼容
+→ 配置 (LLVM=1 + holi-qgki_defconfig + KSU/SUSFS/REKERNEL 开关)
 → 编译 (LLVM=1 + ccache) → 获取原版 boot.img → 打包 → 上传
 ```
 
@@ -57,6 +61,7 @@ Linux version 5.4.302-qgki-g84e7d691ee3a (root@3c794f190b77)
 # 配置 (LLVM=1 让 LD=ld.lld, LTO/CFI 生效)
 make LLVM=1 ARCH=arm64 KCFLAGS='-I. -Idrivers/usb/typec/tcpc' vendor/holi-qgki_defconfig
 ./scripts/config -e KSU -e KALLSYMS -e KALLSYMS_ALL -e KSU_SUSFS \
+  -e REKERNEL \
   -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
   -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
   -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
@@ -298,6 +303,30 @@ HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消
 诊断产物（head_*.symtypes / off_*.symtypes / diff_*.txt）随 artifact 上传，
 供本地精确分析。
 
+## 9. Re:Kernel (binder/signal 卡顿治理, patch 60_)
+
+上游 [JackA1ltman/Re-Kernel](https://github.com/JackA1ltman/Re-Kernel)，
+已移植为 `patches/60_add_rekernel.patch`。它不是 root 方案，而是给
+「墓碑(tombstone)用户」补上系统级的后台冻结/被杀上报：
+
+| 文件 | 改动 |
+|---|---|
+| `drivers/android/binder.c` | 事务 / 回复 / oneway 溢出埋点 (`rekernel_binder_transaction`、`binder_trans_handler`、`binder_reply_handler`、`binder_overflow_handler`) |
+| `kernel/signal.c` | `do_send_sig_info()` 中 SIGKILL/SIGTERM/SIGABRT/SIGQUIT 上报 `rekernel_report(SIGNAL, ...)` |
+| `drivers/rekernel/{Kconfig,Makefile,rekernel.c,rekernel.h}` | 新驱动，`CONFIG_REKERNEL` (default y)，`CONFIG_REKERNEL_NETWORK` (default n) |
+| `drivers/Kconfig` / `drivers/Makefile` | `source "drivers/rekernel/Kconfig"` / `obj-$(CONFIG_REKERNEL) += rekernel/` |
+
+**集成要点**：
+- 与 55_/50_ **无文件重叠**（50_ 只动 `fs/`、`drivers/input/input.c`、`kernel/{kallsyms,reboot,sys}.c`、`mm/`、`security/selinux/avc.c`）→ patch 顺序无约束。
+- `binder.c` / `signal.c` 用 `#include <../rekernel/rekernel.h>`、
+  `<../drivers/rekernel/rekernel.h>` 这类**内核根相对路径**，
+  依赖 `KCFLAGS='-I.'`（配置与编译步骤均已带，与高通相对 include 共用）。
+- 纯 C 埋点 + 新字符设备驱动，不涉及间接调用跳转 → 与 **CFI enforcing 无冲突**；
+  不改变 struct 布局 → 不影响 module_layout CRC。
+- workflow 步骤 4.55 应用后会校验 `rekernel_binder_transaction`、
+  `rekernel_report(SIGNAL`、`source "drivers/rekernel/Kconfig"`、
+  `obj-$(CONFIG_REKERNEL)` 四个标记，缺一即构建失败。
+
 ## 备选: 关闭 CFI 的降级方案
 
 若 CFI enforcing 下 KSU 引发 panic (无法开机)：
@@ -309,9 +338,12 @@ HEAD），我们 checkout 的就是官方树，"树不一致" 这一根因已消
 
 ```
 sukisu-oscar-lto21/
-├── .github/workflows/build-sukisu-lto21.yml   # 24 步 workflow
+├── .github/workflows/build-sukisu-lto21.yml   # 28 步 workflow
 ├── patches/
-│   ├── 50_add_susfs_in_kernel-5.4.patch       # SUSFS 5.4 移植 (同 sukisu-oscar)
-│   └── 70_add_cfi_slowpath.patch              # 仅 enable_cfi=false 时应用 (CFI 关闭兑底)
+│   ├── 50_add_susfs_in_kernel-5.4.patch       # SUSFS 5.4 移植 (含 sucompat ABI rc3 适配)
+│   ├── 55_add_selinux_hide_access_filter.patch # ReSukiSU selinux_hide access 探测过滤
+│   ├── 60_add_rekernel.patch                  # Re:Kernel (binder/signal 卡顿治理)
+│   └── 70_add_cfi_slowpath.patch              # 仅 enable_cfi=false 时应用 (CFI 关闭兜底)
+├── _tools/check_hunk_headers.py               # patch hunk 头校验小工具
 └── README.md
 ```
